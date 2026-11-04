@@ -12,6 +12,8 @@ using MidiWorkbench.Specs;
 
 var tests = new (string Name, Action Run)[]
 {
+    ("harmonic placement and recipe versions", GenerationMusicalSpecs.Run),
+    ("song and bank identity", SongIdentitySpecs.Run),
     ("bounded take history and archive recovery", TakeHistorySpecs.Run),
     ("scheduler timing regressions", TimingRegressionSpecs.Run),
     ("backend safety suite", BackendSafetySpecs.Run),

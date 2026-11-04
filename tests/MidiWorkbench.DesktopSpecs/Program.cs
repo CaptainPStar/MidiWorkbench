@@ -34,9 +34,27 @@ internal static class Program
             AppBuilder.Configure<WorkbenchApp>().UseSkia()
                 .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).SetupWithoutStarting();
             window = new MainWindow(); window.Show(); Pump();
+            if (args.Contains("--pad-only"))
+            {
+                CheckPadRegisterWorkflow(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            if (args.Contains("--viewport-only"))
+            {
+                CheckProgrammaticNoteVisibility(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            CheckProgrammaticNoteVisibility();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckPadRegisterWorkflow();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
             CheckPlaybackIdentity();
             window = new MainWindow(); window.Show(); Pump();
             CheckGeneratorTiming();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckSongBankNames();
             window = new MainWindow(); window.Show(); Pump();
             var session = Field<WorkbenchSession>("session");
             Check(!window.Title!.StartsWith('*'), "Initial project is clean");
@@ -220,6 +238,127 @@ internal static class Program
         var edited = session.SelectedSection.Parts[0].Pattern.Notes.Single(n => n.Id == "beat-precision-319");
         Check(edited.Tick == 240 && edited.Duration == 240, "Quarter-beat field edits commit 240 ticks");
     }
+    private static void CheckProgrammaticNoteVisibility()
+    {
+        var session = Field<WorkbenchSession>("session");
+        var parts = Field<ComboBox>("parts");
+        parts.SelectedItem = parts.ItemsSource!.Cast<object>().Single(item => item.ToString() == "Bass"); Pump();
+        var editor = Field<Control>("roll"); var scroll = Field<ScrollViewer>("rollScroll");
+        var type = editor.GetType();
+        Rect SelectionRect()
+        {
+            var selected = (string?)type.GetProperty("SelectedId")!.GetValue(editor) ?? throw new InvalidOperationException("No selected note");
+            var part = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass);
+            var note = part.Pattern.Notes.Single(n => n.Id == selected);
+            return (Rect)type.GetMethod("NoteRect", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(editor, [note])!;
+        }
+        bool Visible(Rect note) => note.Left >= scroll.Offset.X + 106 - 1 && note.Left < scroll.Offset.X + scroll.Viewport.Width
+            && note.Top >= scroll.Offset.Y + 26 - 1 && note.Top < scroll.Offset.Y + scroll.Viewport.Height;
+        Field<Slider>("zoom").Value = 240; scroll.Offset = new Vector(0, 1500); Pump();
+        Field<NumericUpDown>("pitch").Value = 84; Field<NumericUpDown>("tick").Value = 1;
+        Click("Add note"); Pump();
+        Check(Visible(SelectionRect()), "A field-added C6 note is revealed inside the piano-roll viewport");
+        Field<NumericUpDown>("pitch").Value = 85; Field<NumericUpDown>("tick").Value = 28;
+        Click("Add note"); Pump();
+        Check(Visible(SelectionRect()), "A field-added late note is revealed horizontally at high zoom");
+        Field<NumericUpDown>("pitch").Value = 90; Field<NumericUpDown>("tick").Value = 5;
+        Click("Apply"); Pump();
+        Check(Visible(SelectionRect()), "Applying pitch and time fields reveals the edited selection");
+        scroll.Offset = new Vector(0, 0); Pump();
+        Field<List<Control>>("noteEditControls").OfType<Button>().Single(b => Equals(b.Content, "Duplicate"))
+            .RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(Visible(SelectionRect()), "Duplicating a selected note reveals the new selection");
+        var visibleNote = SelectionRect(); var point = editor.TranslatePoint(new Point(visibleNote.Left + 4, visibleNote.Top + 4), window)!.Value;
+        var offset = scroll.Offset;
+        window.MouseDown(point, MouseButton.Left, RawInputModifiers.None);
+        window.MouseMove(point + new Vector(70, 0), RawInputModifiers.LeftMouseButton); Pump();
+        Check(scroll.Offset == offset, "Pointer dragging does not scroll the note viewport");
+        window.MouseUp(point + new Vector(70, 0), MouseButton.Left, RawInputModifiers.None); Pump();
+        Check(scroll.Offset == offset && SelectionRect().Left > visibleNote.Left, "Releasing a real note drag does not jump the viewport");
+        var noteId = (string)type.GetProperty("SelectedId")!.GetValue(editor)!;
+        var list = Field<ListBox>("notes");
+        var choice = list.ItemsSource!.Cast<object>().Single(item => ((MidiNote)item.GetType().GetProperty("Note")!.GetValue(item)!).Id == noteId);
+        list.SelectedItem = null; scroll.Offset = new Vector(0, 0); Pump();
+        list.SelectedItem = choice; Pump();
+        Check(Visible(SelectionRect()), "Selecting a note from the note list reveals it in the editor");
+        editor.Focus(); SendKey(Key.C, KeyModifiers.Control); scroll.Offset = new Vector(0, 0); Pump(); SendKey(Key.V, KeyModifiers.Control);
+        Check(Visible(SelectionRect()), "Pasting notes reveals the new selection");
+        scroll.Offset = new Vector(0, 0); Pump(); editor.Focus(); SendKey(Key.Up);
+        Check(Visible(SelectionRect()), "Keyboard note movement reveals the moved selection");
+    }
+    private static void CheckPadRegisterWorkflow()
+    {
+        var session = Field<WorkbenchSession>("session");
+        Field<NumericUpDown>("root").Value = 36; Field<NumericUpDown>("bars").Value = 2;
+        Field<TextBox>("scale").Text = "0,2,3,5,7,8,10"; Field<Slider>("density").Value = 1;
+        Click("Preview section"); Until(() => session.Candidate is not null && Field<Button>("accept").IsEnabled); Click("Accept"); Pump();
+        var parts = Field<ComboBox>("parts"); parts.SelectedItem = parts.ItemsSource!.Cast<object>().Single(item => item.ToString() == "Pad"); Pump();
+        var generator = Field<Control>("generators"); var type = generator.GetType();
+        T Member<T>(string name) => (T)type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        Member<ComboBox>("kind").SelectedItem = GeneratorKind.Pad;
+        Member<NumericUpDown>("minPitch").Value = 48; Member<NumericUpDown>("maxPitch").Value = 72;
+        Member<TextBox>("chord").Text = "0,2,4"; Member<TextBox>("progression").Text = "0,3";
+        Member<Button>("preview").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null || session.GenerationStatus.Phase == GenerationPhase.Failed);
+        var candidate = session.Candidate ?? throw new InvalidOperationException($"Pad preview failed: {session.GenerationStatus.Error}");
+        var pattern = candidate.Parts.Single(p => p.Role == PartRole.Pad).Pattern;
+        var barTicks = candidate.Outline.Meter.BarTicks;
+        var groups = pattern.Notes.GroupBy(n => n.Tick / barTicks).OrderBy(g => g.Key).ToArray();
+        Check(groups.Length == 2 && groups.All(g => g.Count() == 3), "Pad preview keeps three voices in each bar when root is below the pitch range");
+        Check(groups[0].Select(n => n.Pitch % 12).Order().SequenceEqual([0, 3, 7])
+            && groups[1].Select(n => n.Pitch % 12).Order().SequenceEqual([0, 5, 8])
+            && pattern.Notes.All(n => n.Pitch is >= 48 and <= 72), "Pad preview preserves both minor-scale chord pitch-class sets in range");
+        Check(groups[0].Select(n => n.Pitch).Order().SequenceEqual([48, 51, 55])
+            && groups[1].Select(n => n.Pitch).Order().SequenceEqual([53, 56, 60]), "Pad preview voices the two chords in the requested register");
+        Field<Button>("accept").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        var path = Path.Combine(evidence, "pad-register-song.midiwork.json"); SetField("projectPath", path); SendKey(Key.S, KeyModifiers.Control); Until(() => File.Exists(path));
+        session.Load(path); Invoke("Reload"); Pump();
+        var saved = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Pad).Pattern;
+        Check(saved.Recipe?.Generator == MidiWorkbench.Generation.PatternGenerator.GeneratorId
+            && saved.Recipe.Version == "pattern-2" && saved.Recipe.Version == MidiWorkbench.Generation.PatternGenerator.Version
+            && saved.Recipe.Settings is { Kind: GeneratorKind.Pad, MinPitch: 48, MaxPitch: 72 }
+            && saved.Notes.Select(n => n.Pitch).SequenceEqual(pattern.Notes.Select(n => n.Pitch)),
+            "Accept, save and reopen preserve Pad voicing and the current recipe");
+
+        var roll = Field<Control>("roll"); var rollType = roll.GetType(); var scroll = Field<ScrollViewer>("rollScroll");
+        bool AnyMaterialVisible(Pattern value)
+        {
+            var visible = new Rect(scroll.Offset.X + 106, scroll.Offset.Y + 26,
+                Math.Max(0, scroll.Viewport.Width - 106), Math.Max(0, scroll.Viewport.Height - 26));
+            return value.Notes.Any(note => ((Rect)rollType.GetMethod("NoteRect", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(roll, [note])!).Intersects(visible));
+        }
+        void WaitForPattern(Pattern value) => Until(() => rollType.GetField("part", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(roll) is Part part
+            && ReferenceEquals(part.Pattern, value));
+        rollType.GetMethod("Select")!.Invoke(roll, [saved.Notes.First().Id]); rollType.GetMethod("RevealSelection")!.Invoke(roll, null); Pump();
+        Member<NumericUpDown>("minPitch").Value = 72; Member<NumericUpDown>("maxPitch").Value = 96;
+        Member<Button>("preview").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null); var high = session.Candidate!.Parts.Single(p => p.Role == PartRole.Pad).Pattern; WaitForPattern(high); Pump();
+        Check(AnyMaterialVisible(high), "Changing the Pad preview register reveals generated material");
+        var selectedId = (string)rollType.GetProperty("SelectedId")!.GetValue(roll)!;
+        Check(Field<NumericUpDown>("pitch").Value == high.Notes.Single(n => n.Id == selectedId).Pitch,
+            "Retained selected note fields refresh to the preview pitch");
+        Field<Button>("accept").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(AnyMaterialVisible(session.SelectedSection.Parts.Single(p => p.Role == PartRole.Pad).Pattern), "Accept keeps the new Pad register visible");
+        scroll.Offset = new Vector(0, 0); Pump(); var manualOffset = scroll.Offset; Pump(); Pump();
+        Check(scroll.Offset == manualOffset, "Ordinary transport refresh preserves manual editor scrolling");
+        Member<NumericUpDown>("minPitch").Value = 48; Member<NumericUpDown>("maxPitch").Value = 72;
+        Member<Button>("preview").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null); var low = session.Candidate!.Parts.Single(p => p.Role == PartRole.Pad).Pattern; WaitForPattern(low); Pump();
+        Field<Button>("discard").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        var accepted = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Pad).Pattern;
+        Check(AnyMaterialVisible(accepted), "Discarding a different-register preview reveals the accepted Pad again");
+        rollType.GetMethod("Select")!.Invoke(roll, [null]); Pump();
+        var visibleOffset = scroll.Offset;
+        Member<Button>("preview").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null); var sameRegister = session.Candidate!.Parts.Single(p => p.Role == PartRole.Pad).Pattern; WaitForPattern(sameRegister); Pump();
+        Check(AnyMaterialVisible(sameRegister) && scroll.Offset == visibleOffset, "Preview preserves a manual viewport that already contains material when no note is selected");
+        Field<Button>("discard").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        rollType.GetMethod("Select")!.Invoke(roll, [null]); scroll.Offset = new Vector(0, 0); Pump();
+        Member<Button>("preview").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null); var noSelection = session.Candidate!.Parts.Single(p => p.Role == PartRole.Pad).Pattern; WaitForPattern(noSelection); Pump();
+        Check(AnyMaterialVisible(noSelection), "Preview reveals generated material when no note is selected and none is visible");
+        Field<Button>("discard").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+    }
     private static void CheckPlaybackIdentity()
     {
             var session = Field<WorkbenchSession>("session");
@@ -340,6 +479,79 @@ internal static class Program
         Check(session.SelectedSection.Parts.Single(p => p.Id == selectedId).Pattern.Recipe?.Settings?.StepTicks == 480, "Accept stores the selected step length in the recipe");
         SetField("savedProject", session.Project); window.Close(); Pump();
     }
+    private static void CheckSongBankNames()
+    {
+        var session = Field<WorkbenchSession>("session");
+        Window Dialog(string title) => window.OwnedWindows.Single(w => w.Title == title);
+        TextBox Name(Window dialog) => dialog.GetVisualDescendants().OfType<TextBox>().Single();
+        void PressDialog(Window target, Key key) { target.KeyPress(key, RawInputModifiers.None, PhysicalKey.None, null); if (target.IsVisible) target.KeyRelease(key, RawInputModifiers.None, PhysicalKey.None, null); Pump(); }
+        void SetNameAndEnter(string title, string value) { var dialog = Dialog(title); Name(dialog).Text = value; PressDialog(dialog, Key.Enter); }
+        void Activate(string content)
+        {
+            var button = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, content) && b.IsEffectivelyVisible);
+            button.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        }
+
+        Click("Rename song"); var invalid = Dialog("Rename song");
+        using (var frame = invalid.CaptureRenderedFrame()) frame!.Save(Path.Combine(evidence, "rename-song-dialog.png"), PngBitmapEncoderOptions.Default);
+        Invoke("StartSong"); Until(() => session.IsRunning); PressDialog(invalid, Key.F8); Until(() => !session.IsRunning);
+        Check(!session.IsRunning && invalid.IsVisible, "F8 stops playback while the name dialog stays open");
+        Name(invalid).Text = "  "; PressDialog(invalid, Key.Enter);
+        Check(invalid.IsVisible && session.Project.Name == "Untitled" && invalid.GetVisualDescendants().OfType<TextBlock>().Any(t => t.IsVisible && t.Text == "Enter a name."),
+            "Blank song name is rejected without changing the project");
+        PressDialog(invalid, Key.Escape); Check(!invalid.IsVisible && session.Project.Name == "Untitled", "Escape cancels naming without mutation");
+        Click("Rename song"); SetNameAndEnter("Rename song", "  First Song  ");
+        Check(session.Project.Name == "First Song" && window.Title!.StartsWith("* First Song", StringComparison.Ordinal), "Renaming trims the song name and marks the project dirty");
+        SendKey(Key.Z, KeyModifiers.Control); Check(session.Project.Name == "Untitled", "Undo restores the previous song name");
+        SendKey(Key.Z, KeyModifiers.Control | KeyModifiers.Shift); Check(session.Project.Name == "First Song", "Redo restores the song name");
+        var songPath = Path.Combine(evidence, "named-project.midiwork.json"); SetField("projectPath", songPath);
+        SendKey(Key.S, KeyModifiers.Control); Until(() => File.Exists(songPath));
+        Check(ProjectStore.Load(songPath).Name == "First Song" && window.Title!.Contains("First Song (named-project.midiwork.json)"),
+            "Saving preserves the song name independently of its filename");
+
+        var workspace = Field<Control>("workspace"); workspace.GetType().GetMethod("Show")!.Invoke(workspace, ["Perform"]); Pump();
+        var bankPanel = window.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Bank")); bankPanel.IsExpanded = true; Pump();
+        Activate("New bank");
+        using (var frame = Dialog("New bank").CaptureRenderedFrame()) frame!.Save(Path.Combine(evidence, "new-bank-dialog.png"), PngBitmapEncoderOptions.Default);
+        SetNameAndEnter("New bank", "Festival");
+        Check(session.Bank?.Name == "Festival" && Field<TextBlock>("bankName").Text == "Festival", "Creating a bank uses the requested name");
+        Activate("Add current");
+        Field<TextBox>("sectionName").Text = "Unapplied verse";
+        Click("Rename song"); SetNameAndEnter("Rename song", "Second Song");
+        Check(session.Project.Name == "Second Song" && Field<TextBox>("sectionName").Text == "Unapplied verse", "Song rename preserves unapplied section settings");
+        Activate("Add current");
+        Check(session.Bank!.Songs.Select(s => s.Project.Name).SequenceEqual(["First Song", "Second Song"])
+            && Field<ListBox>("bankOrder").ItemsSource!.Cast<object>().Select(o => o.ToString()).SequenceEqual(["1. First Song", "2. Second Song"]),
+            "Two named songs appear distinctly in the bank set order");
+        Activate("Rename bank"); SetNameAndEnter("Rename bank", "Tour Set");
+        Check(session.Bank!.Name == "Tour Set" && Field<TextBlock>("bankName").Text == "Tour Set" && window.Title!.Contains("Bank unsaved"),
+            "Renaming a bank updates its read-only label and dirty indicator");
+        bankPanel.GetVisualAncestors().OfType<ScrollViewer>().First().Offset = new Vector(0, 700); Pump();
+        Capture("named-bank-1000x650", 1000, 650);
+        var bankPath = Path.Combine(evidence, "named-bank.json"); session.SaveBank(bankPath);
+        var restored = ProjectStore.LoadBank(bankPath);
+        Check(restored.Name == "Tour Set" && restored.Songs.Select(s => s.Project.Name).SequenceEqual(["First Song", "Second Song"])
+            && restored.Order.Length == 2, "Bank save and reload preserve its name, song names and order");
+        Activate("New bank"); var newBank = Dialog("New bank"); PressDialog(newBank, Key.Escape);
+        Check(session.Bank!.Name == "Tour Set" && session.Bank.Songs.Length == 2, "Cancelling new bank preserves the current bank");
+
+        // A real rename invalidates a prepared preview, so cancellation must preserve it.
+        workspace.GetType().GetMethod("Show")!.Invoke(workspace, ["Outline"]); Pump();
+        Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null);
+        var preview = session.Candidate;
+        Click("Rename song"); SetNameAndEnter("Rename song", "Third Song");
+        var warning = Dialog("Unaccepted preview"); Click(warning, "Cancel"); Pump();
+        Check(session.Project.Name == "Second Song" && ReferenceEquals(session.Candidate, preview), "Cancelling rename preserves the prepared preview and name");
+        Click("Rename song"); SetNameAndEnter("Rename song", "Third Song"); Click(Dialog("Unaccepted preview"), "Discard preview"); Pump();
+        Check(session.Project.Name == "Third Song" && session.Candidate is null && Field<TextBox>("sectionName").Text == "Unapplied verse",
+            "Confirmed rename discards only the preview and retains outline draft");
+        Field<TextBox>("sectionName").Text = session.SelectedSection.Outline.Name;
+        Until(() => !Field<bool>("documentDialog"));
+        workspace.GetType().GetMethod("Reset")!.Invoke(workspace, null); Pump();
+        SetField("savedProject", session.Project); SetField("savedBank", session.Bank!); window.Close(); Pump();
+        Check(!window.IsVisible, "Named project and bank close after pending dialog completes");
+    }
     private static void CheckOutlineDraftProtection(WorkbenchSession session)
     {
         var name = Field<TextBox>("sectionName"); var originalName = name.Text;
@@ -453,6 +665,25 @@ internal static class Program
         Until(() => !session.Status().Running);
         Check(!session.Status().Running, "F8 works in an owned confirmation opened from a floating workflow");
         Click(dialog, "Cancel"); Until(() => confirm.IsCompleted); SetField("documentDialog", false);
+        type.GetMethod("Reset")!.Invoke(workspace, null); Pump();
+        var perform = Walk(host.Layout!).Single(d => d.Id == "Perform"); factory.FloatDockable(perform); Pump();
+        var playSection = Field<Button>("playSection"); var performWindow = TopLevel.GetTopLevel(playSection) as Window;
+        Check(performWindow is not null && performWindow != window, "Perform pane floats into its own window");
+        var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var create = typeof(MainWindow).GetMethod("AsyncButton", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var modal = (Button)create.Invoke(window, ["pending file", (Func<Task>)(() => pending.Task), true, true])!;
+        modal.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        playSection.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(!session.IsRunning, "A pending file dialog blocks Play section in the floating Perform pane");
+        Invoke("StartSong"); Until(() => session.IsRunning); Field<ComboBox>("launchSection").Focus();
+        performWindow!.KeyPress(Key.F8, RawInputModifiers.None, PhysicalKey.None, null);
+        performWindow!.KeyRelease(Key.F8, RawInputModifiers.None, PhysicalKey.None, null); Until(() => !session.IsRunning);
+        Check(!session.IsRunning, "F8 remains available while a file dialog is pending");
+        Invoke("StartSong"); Until(() => session.IsRunning);
+        performWindow!.KeyPress(Key.Space, RawInputModifiers.Control | RawInputModifiers.Shift, PhysicalKey.None, null);
+        performWindow!.KeyRelease(Key.Space, RawInputModifiers.Control | RawInputModifiers.Shift, PhysicalKey.None, null); Until(() => !session.IsRunning);
+        Check(!session.IsRunning, "Panic remains available while a file dialog is pending");
+        pending.SetResult(); Until(() => modal.IsEnabled);
         type.GetMethod("Reset")!.Invoke(workspace, null); Pump();
     }
     private static void CheckArchiveRecovery(WorkbenchSession session)

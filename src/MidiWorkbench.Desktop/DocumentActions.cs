@@ -27,7 +27,57 @@ public sealed partial class MainWindow
         else session.StartSection(session.SelectedSectionId, loop.IsChecked == true);
     }
 
-    private void RefreshDocumentTitle() => Title = $"{(ProjectChanged ? "* " : "")}{(projectPath is null ? session.Project.Name : Path.GetFileName(projectPath))} — MidiWorkbench{(BankChanged ? " · Bank unsaved" : "")}";
+    private void RefreshDocumentTitle() => Title = $"{(ProjectChanged ? "* " : "")}{session.Project.Name}{(projectPath is null ? "" : $" ({Path.GetFileName(projectPath)})")} — MidiWorkbench{(BankChanged ? " · Bank unsaved" : "")}";
+
+    private async Task RenameSong()
+    {
+        var name = await AskName("Rename song", session.Project.Name, "Rename");
+        if (name is null || name == session.Project.Name) return;
+        if ((session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing)
+            && await ConfirmSave("Unaccepted preview", "Renaming will discard the current preview. Continue?", null, "Discard preview") != 2) return;
+        session.RenameProject(name); candidate = null; Reload();
+    }
+
+    private async Task NewBank()
+    {
+        var name = await AskName("New bank", "Bank", "Create");
+        if (name is null || !await ConfirmBankReplacement()) return;
+        session.NewBank(name); savedBank = null; RefreshBank(); RefreshDocumentTitle();
+    }
+
+    private async Task RenameBank()
+    {
+        if (session.Bank is not { } bank) throw new InvalidOperationException("Create or load a bank first.");
+        var name = await AskName("Rename bank", bank.Name, "Rename");
+        if (name is null) return;
+        session.RenameBank(name); RefreshBank(); RefreshDocumentTitle();
+    }
+
+    private async Task<string?> AskName(string title, string initial, string confirmLabel)
+    {
+        var dialog = new Window { Title = title, Width = 420, SizeToContent = SizeToContent.Height, CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false };
+        dialog.AddHandler(KeyDownEvent, HandleShortcuts, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        var name = new TextBox { Text = initial };
+        Avalonia.Automation.AutomationProperties.SetName(name, "Name");
+        var error = new TextBlock { Text = "Enter a name.", Foreground = Brushes.Orange, IsVisible = false };
+        var confirm = new Button { Content = confirmLabel, IsDefault = true };
+        var cancel = new Button { Content = "Cancel", IsCancel = true };
+        void Accept()
+        {
+            var value = name.Text?.Trim();
+            if (string.IsNullOrEmpty(value)) { error.IsVisible = true; name.Focus(); return; }
+            dialog.Close(value);
+        }
+        confirm.Click += (_, _) => Accept(); cancel.Click += (_, _) => dialog.Close(null);
+        name.KeyDown += (_, e) => { if (e.Key == Key.Enter && e.KeyModifiers == KeyModifiers.None) { e.Handled = true; Accept(); } };
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right,
+            Children = { cancel, confirm } };
+        dialog.Content = new StackPanel { Margin = new Thickness(20), Spacing = 12,
+            Children = { new TextBlock { Text = "Name" }, name, error, buttons } };
+        dialog.Opened += (_, _) => { name.Focus(); name.SelectAll(); };
+        return await dialog.ShowDialog<string?>(this);
+    }
 
     private void RefreshOutputStatus()
     {

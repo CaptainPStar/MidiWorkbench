@@ -33,7 +33,7 @@ public sealed partial class MainWindow : Window
     private readonly TextBlock takeHistoryHint = new() { Text = "Recent takes; Load take opens older recordings.", IsVisible = false, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly TextBlock status = new(), beat = new() { FontSize = 20, MinWidth = 120 }, activity = new(), candidateLabel = new();
     private readonly TextBox sectionName = new(), scale = new();
-    private readonly TextBox bankName = new() { Text = "Bank" };
+    private readonly TextBlock bankName = new() { Text = "No bank", TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly ComboBox bankSongs = new() { MinWidth = 180 };
     private readonly ListBox bankOrder = new() { MinHeight = 90, MaxHeight = 200 };
     private readonly ComboBox sections = new() { MinWidth = 180 }, parts = new() { MinWidth = 140 };
@@ -87,7 +87,7 @@ public sealed partial class MainWindow : Window
         routing = new(session, ex => { status.Text = ex?.Message ?? "Routing applied."; if (ex is null) Reload(); });
         arrangement = new(session, action => _ = GuardDraftChange(() => { action(); ClearCandidate(); Reload(); }));
         session.EndpointsChanged += () => Dispatcher.UIThread.Post(() => { if (!closing) { routing.Rebuild(preserveDraft: true); RefreshOutputStatus(); } });
-        var panic = Button("Panic", () => { session.Panic(); Reload(); }); Tip(panic, "Release notes and pedals immediately (Ctrl+Shift+Space)");
+        var panic = Button("Panic", () => { session.Panic(); Reload(); }, emergency: true); Tip(panic, "Release notes and pedals immediately (Ctrl+Shift+Space)");
         panic.Classes.Add("danger");
         undo = AsyncButton("Undo", () => GuardDraftChange(() => { session.Undo(); ClearCandidate(); Reload(); }), true);
         redo = AsyncButton("Redo", () => GuardDraftChange(() => { session.Redo(); ClearCandidate(); Reload(); }), true);
@@ -96,10 +96,10 @@ public sealed partial class MainWindow : Window
         play.Classes.Add("primary");
         cancelQueued = Button("Cancel queue", session.CancelQueuedSection);
         var transport = Wrap(play,
-            Button("Stop", () => { session.Stop(); Reload(); RefreshTakes(); }), panic, loop, Label("BPM", tempo),
+            Button("Stop", () => { session.Stop(); Reload(); RefreshTakes(); }, emergency: true), panic, loop, Label("BPM", tempo),
             Button("Set", () => session.SetTempo((double)(tempo.Value ?? 120))), beat, pulse, queuedStatus, cancelQueued);
         Tip(loop, "Repeat the current playback range"); Tip(tempo, "Quarter-note beats per minute");
-        var files = Wrap(AsyncButton("Open", Open, true, true), AsyncButton("Save", Save, modal: true), AsyncButton("Save as", SaveAs, modal: true), AsyncButton("Save take", SaveTake, true, true),
+        var files = Wrap(AsyncButton("Open", Open, true, true), AsyncButton("Save", Save, modal: true), AsyncButton("Save as", SaveAs, modal: true), AsyncButton("Rename song", RenameSong, true, true), AsyncButton("Save take", SaveTake, true, true),
             AsyncButton("Export MIDI", Export, modal: true), undo, redo);
 
         sections.SelectionChanged += async (_, _) =>
@@ -119,7 +119,7 @@ public sealed partial class MainWindow : Window
         Tip(complexity, "Drum activity; other parts use density");
         accept = Button("Accept", AcceptCandidate);
         accept.Classes.Add("primary");
-        discard = Button("Discard", () => { ClearCandidate(); RefreshNotes(); });
+        discard = Button("Discard", () => { ClearCandidate(); RefreshNotes(); roll.RevealMaterial(); });
         audition = Button("Audition", AuditionCandidate);
         returnAudition = Button("Return", () => session.ReturnFromAudition(CandidateQuantum()));
         cancelGeneration = Button("Cancel preparation", session.CancelGeneration);
@@ -156,7 +156,11 @@ public sealed partial class MainWindow : Window
         };
         notes.SelectionChanged += (_, _) =>
         {
-            if (!syncingNotes) roll.SelectMany(notes.SelectedItems?.OfType<NoteChoice>().Select(n => n.Note.Id) ?? []);
+            if (!syncingNotes)
+            {
+                roll.SelectMany(notes.SelectedItems?.OfType<NoteChoice>().Select(n => n.Note.Id) ?? []);
+                roll.RevealSelection();
+            }
         };
         roll.SelectionChanged += SelectNote;
         roll.CommitEdit = CommitNoteEdit;
@@ -270,15 +274,15 @@ public sealed partial class MainWindow : Window
         return new StackPanel { Spacing = 3, Children = { label, number } };
     }
     private static long BeatsToTicks(decimal value) => (long)decimal.Round(value * MusicalTime.Ppq, 0, MidpointRounding.AwayFromZero);
-    private Button Button(string title, Action action, bool stopped = false)
+    private Button Button(string title, Action action, bool stopped = false, bool emergency = false)
     {
-        var button = new Button { Content = title }; button.Click += (_, _) => Try(action); if (stopped) stoppedControls.Add(button); return button;
+        var button = new Button { Content = title }; button.Click += (_, _) => { if (emergency || !documentDialog && !closePending) Try(action); }; if (stopped) stoppedControls.Add(button); return button;
     }
     private Button AsyncButton(string title, Func<Task> action, bool stopped = false, bool modal = false)
     {
         var button = new Button { Content = title }; button.Click += async (_, _) =>
         {
-            if (pendingButtons.Contains(button) || modal && (documentDialog || closePending)) return;
+            if (pendingButtons.Contains(button) || documentDialog || closePending) return;
             pendingButtons.Add(button); if (modal) documentDialog = true; button.IsEnabled = false;
             try { await action(); } catch (Exception ex) { status.Text = ex.Message; }
             finally { pendingButtons.Remove(button); if (modal) documentDialog = false; button.IsEnabled = !stopped || !session.IsRunning; }
@@ -327,7 +331,7 @@ public sealed partial class MainWindow : Window
             var pending = prepare(); candidate = session.Candidate; RefreshNotes(); UpdateCandidate();
             var result = await pending;
             if (!closing && ReferenceEquals(session.Candidate, result) && session.SelectedSectionId == result.Id)
-            { candidate = result; RefreshNotes(); }
+            { candidate = result; RefreshNotes(); roll.RevealMaterial(); }
         }
         catch (OperationCanceledException) { }
         finally { if (!closing) UpdateCandidate(); }
@@ -340,7 +344,7 @@ public sealed partial class MainWindow : Window
     private void AcceptCandidate()
     {
         session.AcceptGeneration(session.Status().Running ? CandidateQuantum() : 0);
-        candidate = null; Reload();
+        candidate = null; Reload(); roll.RevealMaterial();
     }
     private void AuditionCandidate()
     {
@@ -622,7 +626,7 @@ public sealed partial class MainWindow : Window
     {
         AutomationProperties.SetName(bankSongs, "Bank song"); AutomationProperties.SetName(bankOrder, "Bank order");
         Tip(bankSongs, "Select a saved bank song; Open loads it without starting playback");
-        var pane = Column(Label("Name", bankName), Wrap(AsyncButton("New", async () => { if (await ConfirmBankReplacement()) { session.NewBank(bankName.Text ?? "Bank"); savedBank = null; RefreshBank(); } }, true, true),
+        var pane = Column(Label("Bank", bankName), Wrap(AsyncButton("New bank", NewBank, true, true), AsyncButton("Rename bank", RenameBank, true, true),
             AsyncButton("Load bank", LoadBank, true, true), AsyncButton("Save bank", SaveBank, true, true)),
             Label("Song", bankSongs), Wrap(Button("Add current", () => { session.AddCurrentToBank(); RefreshBank(); }, true),
                 AsyncButton("Open", async () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id && await ConfirmProjectReplacement()) { session.OpenBankSong(id); savedProject = session.Project; projectPath = null; candidate = null; currentPart = null; Reload(); } }, true, true),
@@ -635,7 +639,7 @@ public sealed partial class MainWindow : Window
     private void RefreshBank()
     {
         var bank = session.Bank; var selected = (bankSongs.SelectedItem as Choice)?.Id; var index = bankOrder.SelectedIndex;
-        if (bank is null) { bankSongs.ItemsSource = null; bankOrder.ItemsSource = null; return; }
+        if (bank is null) { bankName.Text = "No bank"; bankSongs.ItemsSource = null; bankOrder.ItemsSource = null; return; }
         bankName.Text = bank.Name;
         var songs = bank.Songs.Select(s => new Choice(s.Id, s.Project.Name)).ToArray(); bankSongs.ItemsSource = songs;
         bankSongs.SelectedItem = songs.FirstOrDefault(s => s.Id == selected) ?? songs.FirstOrDefault();

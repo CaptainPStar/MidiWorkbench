@@ -156,6 +156,18 @@ public sealed class WorkbenchSession : IDisposable
     }
     public void SetArrangement(IEnumerable<ArrangementEntry> entries)
     { lock (gate) { RequireStopped(); CommitRecording(); Apply(project with { Arrangement = entries.ToImmutableArray() }); } }
+    public void RenameProject(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Enter a project name.", nameof(name));
+        name = name.Trim();
+        lock (gate)
+        {
+            EnsureOpen(); RequireStopped();
+            if (project.Name == name) return;
+            CommitRecording();
+            Apply(project with { Name = name });
+        }
+    }
     public void Undo() => History(undo, redo);
     public void Redo() => History(redo, undo);
     private void History(Stack<SongProject> from, Stack<SongProject> to)
@@ -233,15 +245,16 @@ public sealed class WorkbenchSession : IDisposable
         return PrepareAsync((section, token) =>
         {
             token.ThrowIfCancellationRequested();
-            var generators = new Dictionary<string, GeneratorSettings>(StringComparer.Ordinal);
-            foreach (var part in section.Parts)
+            var variedParts = section.Parts.Select(part =>
             {
                 token.ThrowIfCancellationRequested();
-                if (part.Pattern.Kind == PatternKind.Fixed || part.Pattern.Recipe is not { Generator: PatternGenerator.GeneratorId } recipe) continue;
+                if (part.Pattern.Kind == PatternKind.Fixed || part.Pattern.Recipe is not { Generator: PatternGenerator.GeneratorId } recipe) return part;
                 PatternGenerator.ValidateRecipe(recipe);
-                generators.Add(part.Id, recipe.Settings! with { Seed = VariationSeed(seed, part.Id) });
-            }
-            var result = new SectionGenerator().Generate(section.Outline with { Seed = seed }, section, drummer, basicDrums, generators);
+                return part with { Pattern = part.Pattern with { Recipe = recipe with { Settings = recipe.Settings! with { Seed = VariationSeed(seed, part.Id) } } } };
+            }).ToImmutableArray();
+            // Vary the stored recipe's seed without choosing a newer algorithm. Explicit
+            // part-settings generation remains the operation that creates a current recipe.
+            var result = new SectionGenerator().Generate(section.Outline with { Seed = seed }, section with { Parts = variedParts }, drummer, basicDrums);
             token.ThrowIfCancellationRequested();
             return result with { Parts = result.Parts.Select(p => section.Parts.FirstOrDefault(old => old.Id == p.Id) is { } old
                 ? p with { Muted = old.Muted, Solo = old.Solo } : p).ToImmutableArray() };
@@ -750,6 +763,19 @@ public sealed class WorkbenchSession : IDisposable
     {
         var value = new SongBank(SongBank.CurrentSchemaVersion, name, [], []); value.Validate();
         lock (gate) bank = value;
+    }
+    public void RenameBank(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Enter a bank name.", nameof(name));
+        name = name.Trim();
+        lock (gate)
+        {
+            EnsureOpen(); RequireStopped();
+            var current = bank ?? throw new InvalidOperationException("No bank open.");
+            if (current.Name == name) return;
+            var value = current with { Name = name }; value.Validate();
+            bank = value;
+        }
     }
     public void LoadBank(string path)
     {

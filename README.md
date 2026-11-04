@@ -50,7 +50,7 @@ Or `bash scripts/publish.sh win-x64`. Output is under `artifacts/win-x64/`. Run 
 2. Outline: set meter, root, scale and musical amounts. Preview a section or a part generator. Choose its step length as a note value, triplet, dotted note or custom quarter-note beats. Audition, then Accept or Discard.
 3. Patterns: click empty space to add a note; drag it to move, or drag its right edge to resize. Right-click/Delete removes. Start beat is counted from 1; length is in quarter-note beats (0.25 = a sixteenth note), independent of meter. Pitch shows the note name and MIDI number. Locked notes survive regeneration. Pattern kind explicitly controls Fixed/Hybrid/Generative behavior.
 4. Perform: arm a part or New part, then use Record section. Both start actions record while a target is armed. Stop keeps the keyboard notes. Arm changes require stopped playback.
-5. Arrange sections with repeats or queue a section at a beat/bar boundary. The playback status names the sounding section independently of the editor selection, and identifies previews, take replay and recording. Song banks hold reusable project snapshots and setlist order.
+5. Arrange sections with repeats or queue a section at a beat/bar boundary. The playback status names the sounding section independently of the editor selection, and identifies previews, take replay and recording. Use Rename song to give each project a recognizable title. Song banks hold reusable project snapshots and setlist order; New bank and Rename bank set the bank title.
 6. Save the project, export the song as MIDI, or recall a captured take. A DAW or MusicSessionTrace can capture the performance; built-in recording remains available for phrase development.
 
 See [live generation and editing](docs/live-generation.md) for audition, variation, cancellation and keyboard controls.
@@ -72,7 +72,7 @@ The Perform pane shows recent takes. **Save selected** writes the selected recor
 
 `scripts/verify.ps1` also renders the desktop offscreen and exercises its controls without sending OS input. Images and results are written to `artifacts/desktop-ux`. Tests isolate local settings using `MIDIWORKBENCH_SETTINGS_DIRECTORY`; ordinary launches use `%LOCALAPPDATA%\MidiWorkbench`.
 
-Arpeggiators can use captured notes as their source. Generator settings preserve that material in the recipe. Change only the part you intend to vary; Fixed material remains protected until explicitly converted.
+Arpeggiators can use captured notes as their source. Generator settings preserve that material in the recipe. Change only the part you intend to vary; Fixed material remains protected until explicitly converted. New chord and arpeggio recipes preserve harmonic tones when fitting the pitch range; widen the range if all requested voices cannot fit. Saved older recipes keep their original algorithm until you explicitly preview and accept new part settings.
 
 ## CLI
 
