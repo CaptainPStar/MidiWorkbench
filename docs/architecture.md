@@ -22,6 +22,8 @@ The application separates musical material, prepared plans, machine routing, tra
 
 Immediate ports receive queued messages at their deadlines. Scheduled ports accept future timestamps and must implement cancellation. WinMM is immediate. The worker's high-resolution wait reduces wake granularity; timestamps do not certify physical output timing. Shared process/runtime pauses and driver behavior still require measurement.
 
+The worker merges eligible per-port FIFO heads by deadline, rotating equal-deadline ties across ports. Newly pumped output participates in the same merge. This preserves each port's order while preventing one port's dense chord from delaying all other ports' clocks. Waiting is capped at the nearer of one millisecond and the next pending deadline. A bounded, process-once preparation run exercises managed scheduler paths against isolated silent ports before the first real transport origin; it opens no devices and never enters a user's capture.
+
 ## Timing and ownership
 
 Musical time is 960 PPQ. MIDI Clock is 24 pulses per quarter note. Tempo changes preserve musical position. A plan keeps note events separate from clock generation. External clock following is a future mode; internal master owns timing in this version.
@@ -39,6 +41,8 @@ Capture records input, submitted output and actions separately. Thru retains its
 Recording is armed while stopped and committed as locked notes after Stop. The target is stable during recording. Loop passes overdub into the section; cross-boundary note tails are currently shortened. Raw input retains controllers, while phrase conversion represents sustain as note duration. This distinction is visible in the saved take versus the editable phrase.
 
 Completed takes can be archived atomically by the application and recovered on startup. Active capture still uses bounded in-memory storage; it is not a crash-recoverable streaming recorder. An incomplete take is explicitly marked. An output timestamp is a submission/deadline, not proof of sound onset.
+
+The recent-take cache loads at most the newest 16 archive files at startup and trims saved copies toward 16 takes / 200,000 input-plus-output events. It always retains the latest take, even if an imported take alone exceeds that event budget. Files are never deleted by cache eviction. Unsaved takes are retained; sessions without automatic archiving stop accepting new recordings at the unsaved-history limit until a take is saved as JSON. A failed automatic archive leaves the current capture intact and blocks replacement until a successful archive or explicit JSON recovery save. UI transport safety predicates use a side-effect-free running snapshot, so archive failure cannot disable the recovery picker.
 
 Replay uses captured output timing rather than regenerating recipes. Recorded clock messages are replayed without an additional generated clock stream. Current-rig destinations or explicit endpoint mappings determine playback routing. SMF export retains tempo and arrangement meter changes.
 

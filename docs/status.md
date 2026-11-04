@@ -1,5 +1,16 @@
 # Verification status
 
+## 2026-11-04 timing and workflow follow-up
+
+- Locked restore and serial Release verification pass with zero warnings/errors: 55 core specification groups and 100 offscreen desktop assertions.
+- Draft protection now covers section/part selection, drummer settings, generator settings and undo/redo. Floating panes and owned confirmation dialogs receive Stop/Panic shortcuts. File dialogs require stopped playback; existing-path project Save remains available while playing.
+- Saved take history is bounded, older files remain loadable, selected takes can be saved explicitly, and archive failure retains capture with a tested JSON recovery path. Output faults take precedence over optional-input notices.
+- Deadline-ordered, fair cross-port dispatch, isolated scheduler preparation and deadline-aware waits improve measured virtual timing. The final 60-second idle and 300-second load probes pass note/clock integrity, sustain cleanup, shutdown and reopen on all four approved ports.
+- The five-minute run delivered 19,200 balanced note pairs and 14,400 clocks per port, with no late attacks or skipped clocks. It deliberately exceeded the 100,000-entry capture limit: incomplete capture was reported while output continued correctly.
+- Load-run clock spacing error p99 was 0.864–0.875 ms, maximum 6.636 ms; callback inter-port clock skew p99/max was 0.131/3.124 ms. These measured improvements do not certify physical synth timing.
+
+See [workflow and verification evidence](reports/performance-acceptance-2026-11-04.md) and [timing diagnosis](reports/windows-timing-2026-11-04.md). The earlier sections remain historical measurements of earlier revisions. Physical instrument and native human acceptance remain open.
+
 ## 2026-11-04 Windows integration
 
 - Windows 10.0.19045, x64, .NET SDK 10.0.401: locked restore and Release build pass without warnings/errors. The complete engine/application specification executable passes 53/53 groups.

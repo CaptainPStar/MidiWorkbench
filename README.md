@@ -57,6 +57,10 @@ See [live generation and editing](docs/live-generation.md) for audition, variati
 
 Save writes the accepted project. An unaccepted preview is separate and is not included until accepted. Closing or opening another project prompts for unsaved project/bank changes and unaccepted section changes. Save remembers the file path; Save as writes another file. Stopping and editing retain unapplied section settings until the accepted outline or selected section changes.
 
+Changing sections, changing the generator's part, and project history actions protect unapplied settings with a Cancel/Discard choice. Stop and Panic shortcuts also work in floating panes and the app's confirmation dialogs. File dialogs require stopped playback; Save to an existing project path remains available while playing.
+
+The Perform pane shows recent takes. **Save selected** writes the selected recording; the top **Save take** action writes the current capture. Older archived recordings remain on disk and can be opened with **Load take**. If automatic archiving fails, stop and save the current take as JSON to a writable folder before starting again. MIDI export contains output music, but is not a substitute for the JSON take's input and action history.
+
 | Shortcut | Action |
 |---|---|
 | F5 | Play/stop the song, or the armed section |

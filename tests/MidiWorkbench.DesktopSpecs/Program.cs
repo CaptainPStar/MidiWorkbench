@@ -41,6 +41,8 @@ internal static class Program
             Capture("initial-1000x650", 1000, 650);
             CheckControlsFit("prepareSection", "varySection", "audition", "returnAudition", "accept", "discard");
             CheckOutlineDraftProtection(session);
+            CheckModalGate();
+            CheckFloatingShortcuts(session);
 
             // Preview remains separate, while acceptance creates a dirty, undoable project edit.
             var original = session.Project;
@@ -86,6 +88,15 @@ internal static class Program
             SendKey(Key.Space, KeyModifiers.Control | KeyModifiers.Shift);
             Until(() => !session.Status().Running);
             Check(!session.Status().Running, "Ctrl+Shift+Space panics transport");
+            var availableTakes = Field<PerformanceTake[]>("takeItems");
+            Check(availableTakes.Length >= 2, "Several takes are available for explicit selection");
+            Field<ComboBox>("takes").SelectedIndex = 0;
+            var selectedTake = (PerformanceTake)typeof(MainWindow).GetMethod("SelectedTake", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, null)!;
+            Check(ReferenceEquals(selectedTake, availableTakes[0]) && !ReferenceEquals(selectedTake, availableTakes[^1]), "Save selected resolves the chosen older take");
+            var selectedPath = Path.Combine(evidence, "selected-older-take.json");
+            session.SaveTake(selectedPath, selectedTake);
+            Check(System.Text.Json.JsonSerializer.Serialize(ProjectStore.LoadTake(selectedPath)) == System.Text.Json.JsonSerializer.Serialize(selectedTake),
+                "Saving selected writes the older take, not the latest capture");
             CheckBeatFields(session);
 
             // Exercise live audition/return at a beat boundary while the accepted section is looping.
@@ -101,6 +112,7 @@ internal static class Program
             Check(session.AuditionStatus.Phase == AuditionPhase.Idle, "Return restores accepted playback");
             SendKey(Key.F8); Until(() => !session.Status().Running);
             Click("Discard");
+            CheckArchiveRecovery(session);
 
             // Make another real UI edit and verify close protection, focus and cancellation.
             Click("Add note");
@@ -211,6 +223,9 @@ internal static class Program
         Field<NumericUpDown>("tempo").Value = 121; Click("Set");
         Check(name.Text == "Pending section name", "Tempo reload preserves unapplied section settings");
         SendKey(Key.Z, KeyModifiers.Control);
+        Check(window.OwnedWindows.Single().Title == "Unaccepted changes", "Undo protects unapplied section settings");
+        Click(window.OwnedWindows.Single(), "Cancel"); Pump();
+        session.Undo(); Invoke("Reload");
         SendKey(Key.F8);
         Check(name.Text == "Pending section name", "Stop and ordinary reload preserve unapplied section settings");
         Check(!window.Title!.StartsWith('*'), "Undo tempo returns accepted project to clean state");
@@ -225,6 +240,123 @@ internal static class Program
         Check(window.IsVisible && name.Text == "Pending section name", "Cancel close preserves unapplied outline");
         name.Text = originalName;
         Check(ReferenceEquals(Field<SongProject>("savedProject"), session.Project), "Draft protection does not mutate accepted project");
+
+        var firstSection = session.SelectedSectionId;
+        session.AddSection(); session.SelectSection(firstSection); Invoke("Reload");
+        name.Text = "Section switch draft";
+        Field<ComboBox>("sections").SelectedIndex = 1; Pump();
+        Check(window.OwnedWindows.Single().Title == "Unaccepted changes", "Changing section protects outline draft");
+        Click(window.OwnedWindows.Single(), "Cancel"); Pump();
+        Check(session.SelectedSectionId == firstSection && name.Text == "Section switch draft", "Cancel restores section selection and draft");
+        name.Text = originalName; session.Undo(); Invoke("Reload");
+
+        var complexity = Field<Slider>("complexity"); var initialComplexity = complexity.Value;
+        complexity.Value = initialComplexity == .9 ? .8 : .9;
+        Click("Add");
+        Check(window.OwnedWindows.Single().Title == "Unaccepted changes", "Adding a section protects drummer settings");
+        Click(window.OwnedWindows.Single(), "Cancel"); Pump();
+        Check(complexity.Value == .9 && session.Project.Sections.Length == 1, "Cancel preserves drummer draft and section");
+        complexity.Value = initialComplexity;
+
+        var generator = Field<Control>("generators");
+        var generatorSeed = (NumericUpDown)generator.GetType().GetField("seed", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        var initialSeed = generatorSeed.Value; generatorSeed.Value = (initialSeed ?? 0) + 1;
+        var parts = Field<ComboBox>("parts"); var oldPart = parts.SelectedIndex; parts.SelectedIndex = oldPart == 0 ? 1 : 0; Pump();
+        Check(window.OwnedWindows.Single().Title == "Unaccepted changes", "Changing part protects generator settings");
+        Click(window.OwnedWindows.Single(), "Cancel"); Pump();
+        Check(parts.SelectedIndex == oldPart && generatorSeed.Value == initialSeed + 1, "Cancel keeps part and generator draft");
+        generatorSeed.Value = initialSeed;
+    }
+    private static void CheckModalGate()
+    {
+        var pending = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var create = typeof(MainWindow).GetMethod("AsyncButton", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var first = (Button)create.Invoke(window, ["pending", (Func<Task>)(() => pending.Task), true, true])!;
+        var second = (Button)create.Invoke(window, ["other", (Func<Task>)(() => { calls++; return Task.CompletedTask; }), true, true])!;
+        first.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(!first.IsEnabled, "Timer keeps a pending dialog action disabled");
+        second.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(calls == 0, "Shared dialog gate blocks a second file action");
+        pending.SetResult(); Until(() => first.IsEnabled);
+        second.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(calls == 1, "File actions resume after dialog completes");
+    }
+    private static void CheckFloatingShortcuts(WorkbenchSession session)
+    {
+        Field<ComboBox>("sections").Focus();
+        SendKey(Key.F5); Until(() => session.Status().Running);
+        Check(session.Status().Running, "F5 in docked pane starts once");
+        SendKey(Key.F5); Until(() => !session.Status().Running);
+        Check(!session.Status().Running, "F5 in docked pane stops once");
+        var workspace = Field<Control>("workspace");
+        var type = workspace.GetType();
+        var factory = (Dock.Model.Core.IFactory)type.GetField("factory", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(workspace)!;
+        var host = (Dock.Avalonia.Controls.DockControl)type.GetField("host", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(workspace)!;
+        static IEnumerable<Dock.Model.Core.IDockable> Walk(Dock.Model.Core.IDockable node)
+        {
+            yield return node;
+            if (node is Dock.Model.Core.IDock dock)
+                foreach (var child in dock.VisibleDockables ?? []) foreach (var nested in Walk(child)) yield return nested;
+        }
+        var outline = Walk(host.Layout!).Single(d => d.Id == "Outline");
+        factory.FloatDockable(outline); Pump();
+        var sections = Field<ComboBox>("sections");
+        var floating = TopLevel.GetTopLevel(sections) as Window;
+        Check(floating is not null && floating != window, "Outline actually floats into another window");
+        sections.Focus();
+        Invoke("StartSong"); Until(() => session.Status().Running);
+        floating!.KeyPress(Key.F8, RawInputModifiers.None, PhysicalKey.None, null);
+        floating!.KeyRelease(Key.F8, RawInputModifiers.None, PhysicalKey.None, null);
+        Until(() => !session.Status().Running);
+        Check(!session.Status().Running, "F8 in floating pane stops playback");
+        Invoke("StartSong"); Until(() => session.Status().Running);
+        floating!.KeyPress(Key.Space, RawInputModifiers.Control | RawInputModifiers.Shift, PhysicalKey.None, null);
+        floating!.KeyRelease(Key.Space, RawInputModifiers.Control | RawInputModifiers.Shift, PhysicalKey.None, null);
+        Until(() => !session.Status().Running);
+        Check(!session.Status().Running, "Panic shortcut in floating pane stops playback");
+        Invoke("StartSong"); Until(() => session.Status().Running);
+        floating!.KeyPress(Key.S, RawInputModifiers.Control, PhysicalKey.None, null);
+        floating!.KeyRelease(Key.S, RawInputModifiers.Control, PhysicalKey.None, null); Pump();
+        Check(session.Status().Running && Field<TextBlock>("status").Text!.Contains("Stop playback before opening"),
+            "First Save refuses a native picker while playback continues");
+        SetField("documentDialog", true);
+        var confirm = (Task<int>)typeof(MainWindow).GetMethod("ConfirmSave", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(window, ["Test confirmation", "Confirm", null, "Discard"])!;
+        Pump(); var dialog = window.OwnedWindows.Single(w => w.Title == "Test confirmation");
+        dialog.KeyPress(Key.F8, RawInputModifiers.None, PhysicalKey.None, null);
+        dialog.KeyRelease(Key.F8, RawInputModifiers.None, PhysicalKey.None, null);
+        Until(() => !session.Status().Running);
+        Check(!session.Status().Running, "F8 works in an owned confirmation opened from a floating workflow");
+        Click(dialog, "Cancel"); Until(() => confirm.IsCompleted); SetField("documentDialog", false);
+        type.GetMethod("Reset")!.Invoke(workspace, null); Pump();
+    }
+    private static void CheckArchiveRecovery(WorkbenchSession session)
+    {
+        var directory = session.TakeDirectory!;
+        var held = directory + "-held-for-test";
+        var recoveryPath = Path.Combine(evidence, "recovered-take.json");
+        Invoke("StartSong"); Until(() => session.IsRunning);
+        Directory.Move(directory, held);
+        File.WriteAllText(directory, "injected archive failure");
+        try
+        {
+            Click("Stop"); Pump();
+            Check(!session.IsRunning && Field<TextBlock>("status").Text!.Contains("Take archive failed"), "Archive failure is visible after stop");
+            Check(FindButton(window, "Save take").IsEffectivelyEnabled, "Archive failure leaves Save take enabled");
+            SetField("takeSavePicker", (Func<Task<string?>>)(() => Task.FromResult<string?>(recoveryPath)));
+            Click("Save take"); Until(() => File.Exists(recoveryPath));
+            Check(ProjectStore.LoadTake(recoveryPath).Complete, "Save take action writes recovery JSON outside the failed archive");
+            Invoke("StartSong"); Until(() => session.IsRunning);
+            Check(session.IsRunning, "Playback restarts after explicit take recovery");
+        }
+        finally
+        {
+            typeof(MainWindow).GetField("takeSavePicker", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, null);
+            File.Delete(directory); Directory.Move(held, directory);
+            if (session.IsRunning) session.Stop();
+            Pump();
+        }
     }
     private static void CheckRoutingFit()
     {

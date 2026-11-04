@@ -24,6 +24,7 @@ public static class BackendSafetySpecs
         InputDisconnectStopsWithoutUiPolling();
         SessionInputReconnect();
         OfflineUnarmedInputDoesNotBlockPlayback();
+        OutputFaultTakesPriorityOverOfflineInputNotice();
     }
     private static ResolvedPlan PedalPlan() => Build.Plan(new MidiNote("n", 0, 960, 60, 100)) with
     {
@@ -163,6 +164,19 @@ public static class BackendSafetySpecs
         try { session.Arm(WorkbenchSession.NewPhrase); throw new Exception("Recording armed without its input"); }
         catch (MidiPortException) { }
     }
+    private static void OutputFaultTakesPriorityOverOfflineInputNotice()
+    {
+        using var backend = new DisconnectableBackend();
+        using var session = new WorkbenchSession(new SessionOptions(backend));
+        session.SetRig(Rig.Memory(WorkbenchSession.Destinations(session.Project)) with { Input = "keyboard" });
+        backend.Input!.Disconnect(); backend.Available = false;
+        session.StartSection(true);
+        Check(session.Status().Error?.Contains("keyboard") == true, "Offline input notice was not established");
+        backend.OutputFailed = true;
+        Check(SpinWait.SpinUntil(() => !session.Status().Running, TimeSpan.FromSeconds(2)), "Output fault did not stop playback");
+        var error = session.Status().Error;
+        Check(error?.Contains("memory") == true && !error.Contains("keyboard"), "Optional input notice masked the active output fault");
+    }
     private sealed class DisconnectableInput : IMidiInputPort
     {
         private volatile bool faulted;
@@ -177,11 +191,21 @@ public static class BackendSafetySpecs
         public DisconnectableInput? Input { get; private set; }
         public int Opens { get; private set; }
         public bool Available { get; set; } = true;
+        public volatile bool OutputFailed;
         public event Action? EndpointsChanged { add { } remove { } }
         public IReadOnlyList<MidiEndpoint> Endpoints() => [..memory.Endpoints(), new("keyboard", "Keyboard", true, false)];
-        public IMidiOutputPort OpenOutput(string endpointId) => memory.OpenOutput(endpointId);
+        public IMidiOutputPort OpenOutput(string endpointId) => new FaultableOutput(memory.OpenOutput(endpointId), this);
         public IMidiInputPort OpenInput(string endpointId, Action<TimedMidi> received)
         { if (endpointId != "keyboard" || !Available) throw new MidiPortException("Input 'keyboard' is unavailable"); Opens++; return Input = new(); }
         public void Dispose() { Input?.Dispose(); memory.Dispose(); }
+        private sealed class FaultableOutput(IMidiOutputPort inner, DisconnectableBackend backend) : IMidiOutputPort
+        {
+            public string EndpointId => inner.EndpointId;
+            public bool ScheduledSend => inner.ScheduledSend;
+            public bool Faulted => backend.OutputFailed || inner.Faulted;
+            public void Submit(TimedMidi message) => inner.Submit(message);
+            public void Cancel(double after) => inner.Cancel(after);
+            public void Dispose() => inner.Dispose();
+        }
     }
 }

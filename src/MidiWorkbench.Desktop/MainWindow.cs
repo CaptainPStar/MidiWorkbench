@@ -29,6 +29,7 @@ public sealed partial class MainWindow : Window
     private readonly BeatPulse pulse = new() { Width = 220 };
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(50) };
     private readonly TextBlock selectedCount = new(), queuedStatus = new();
+    private readonly TextBlock takeHistoryHint = new() { Text = "Recent takes; Load take opens older recordings.", IsVisible = false, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly TextBlock status = new(), beat = new() { FontSize = 20, MinWidth = 120 }, activity = new(), candidateLabel = new();
     private readonly TextBox sectionName = new(), scale = new();
     private readonly TextBox bankName = new() { Text = "Bank" };
@@ -52,6 +53,8 @@ public sealed partial class MainWindow : Window
     private readonly ListBox notes = new() { MaxHeight = 130, SelectionMode = SelectionMode.Multiple };
     private readonly NumericUpDown pitch = Number(0, 127, 60), velocity = Number(1, 127, 90), tick = Number(1, 1000001, 1), duration = Number(1m / MusicalTime.Ppq, 1000000, .25m);
     private readonly List<Control> stoppedControls = new();
+    private readonly HashSet<Control> pendingButtons = new();
+    private Func<Task<string?>>? takeSavePicker = null;
     private readonly List<Control> noteEditControls = new();
     private readonly Button play, undo, redo, accept, discard, audition, returnAudition, cancelGeneration, prepareSection, varySection, cancelQueued;
     private readonly ComboBox candidateBoundary = new() { ItemsSource = new[] { "Bar", "Beat" }, SelectedIndex = 0 };
@@ -67,6 +70,8 @@ public sealed partial class MainWindow : Window
     private PerformanceTake? replayingTake;
     private GeneratorSettings? loadedGeneratorSettings;
     private Outline? loadedOutline;
+    private (int Persona, double Complexity, double Fills, double Swing, bool HalfTime)? loadedDrummer;
+    private (int, double, double, double, bool) CurrentDrummer() => (drummer.SelectedIndex, complexity.Value, fills.Value, swing.Value, halfTime.IsChecked == true);
 
     public MainWindow()
     {
@@ -79,12 +84,12 @@ public sealed partial class MainWindow : Window
         session = new(new SessionOptions(backend, Path.Combine(Settings, "rig.json"), new HostOptions(Wait: WindowsMidi.CreateWait()), Path.Combine(Settings, "takes")));
         savedProject = session.Project;
         routing = new(session, ex => { status.Text = ex?.Message ?? "Routing applied."; if (ex is null) Reload(); });
-        arrangement = new(session, action => Try(() => { action(); ClearCandidate(); Reload(); }));
+        arrangement = new(session, action => _ = GuardDraftChange(() => { action(); ClearCandidate(); Reload(); }));
         session.EndpointsChanged += () => Dispatcher.UIThread.Post(() => { if (!closing) { routing.Rebuild(preserveDraft: true); RefreshOutputStatus(); } });
         var panic = Button("Panic", () => { session.Panic(); Reload(); }); Tip(panic, "Release notes and pedals immediately (Ctrl+Shift+Space)");
         panic.Classes.Add("danger");
-        undo = Button("Undo", () => { session.Undo(); ClearCandidate(); Reload(); }, true);
-        redo = Button("Redo", () => { session.Redo(); ClearCandidate(); Reload(); }, true);
+        undo = AsyncButton("Undo", () => GuardDraftChange(() => { session.Undo(); ClearCandidate(); Reload(); }), true);
+        redo = AsyncButton("Redo", () => GuardDraftChange(() => { session.Redo(); ClearCandidate(); Reload(); }), true);
         Tip(undo, "Undo the last project edit (Ctrl+Z)"); Tip(redo, "Redo the last undone edit (Ctrl+Shift+Z)");
         play = Button("Play song", StartSong);
         play.Classes.Add("primary");
@@ -93,14 +98,21 @@ public sealed partial class MainWindow : Window
             Button("Stop", () => { session.Stop(); Reload(); RefreshTakes(); }), panic, loop, Label("BPM", tempo),
             Button("Set", () => session.SetTempo((double)(tempo.Value ?? 120))), beat, pulse, queuedStatus, cancelQueued);
         Tip(loop, "Repeat the current playback range"); Tip(tempo, "Quarter-note beats per minute");
-        var files = Wrap(AsyncButton("Open", Open, true), AsyncButton("Save", Save), AsyncButton("Save as", SaveAs), AsyncButton("Save take", SaveTake, true),
-            AsyncButton("Export MIDI", Export), undo, redo);
+        var files = Wrap(AsyncButton("Open", Open, true, true), AsyncButton("Save", Save, modal: true), AsyncButton("Save as", SaveAs, modal: true), AsyncButton("Save take", SaveTake, true, true),
+            AsyncButton("Export MIDI", Export, modal: true), undo, redo);
 
-        sections.SelectionChanged += (_, _) => { if (!loading && sections.SelectedItem is Choice { Id: { } id }) Try(() => { session.SelectSection(id); ClearCandidate(); currentPart = null; Reload(); }); };
-        var sectionTools = Wrap(Button("Add", () => { session.AddSection(); ClearCandidate(); Reload(); }, true),
-            Button("Duplicate", () => { session.DuplicateSection(session.SelectedSectionId); ClearCandidate(); Reload(); }, true),
-            Button("Remove", () => { session.RemoveSection(session.SelectedSectionId); ClearCandidate(); Reload(); }, true),
-            Button("Up", () => MoveSection(-1), true), Button("Down", () => MoveSection(1), true));
+        sections.SelectionChanged += async (_, _) =>
+        {
+            if (loading || sections.SelectedItem is not Choice { Id: { } id } || id == session.SelectedSectionId) return;
+            loading = true;
+            try { sections.SelectedItem = sections.ItemsSource?.OfType<Choice>().FirstOrDefault(c => c.Id == session.SelectedSectionId); }
+            finally { loading = false; }
+            await GuardDraftChange(() => { session.SelectSection(id); ClearCandidate(); currentPart = null; Reload(); });
+        };
+        var sectionTools = Wrap(AsyncButton("Add", () => GuardDraftChange(() => { session.AddSection(); ClearCandidate(); Reload(); }), true),
+            AsyncButton("Duplicate", () => GuardDraftChange(() => { session.DuplicateSection(session.SelectedSectionId); ClearCandidate(); Reload(); }), true),
+            AsyncButton("Remove", () => GuardDraftChange(() => { session.RemoveSection(session.SelectedSectionId); ClearCandidate(); Reload(); }), true),
+            AsyncButton("Up", () => GuardDraftChange(() => MoveSection(-1)), true), AsyncButton("Down", () => GuardDraftChange(() => MoveSection(1)), true));
         Tip(sectionTools, "Reorder sections; the song follows this order unless a custom song order is set");
         drummer.SelectionChanged += (_, _) => { if (!loading && drummer.SelectedIndex > 0) ShowDrummer(DrumPersonas.All[drummer.SelectedIndex - 1].Id, null); };
         Tip(complexity, "Drum activity; other parts use density");
@@ -133,7 +145,14 @@ public sealed partial class MainWindow : Window
         generators.Error += ex => status.Text = ex.Message;
         generators.Prepare = PreparePartAsync;
 
-        parts.SelectionChanged += (_, _) => { if (!loading) { currentPart = null; RefreshNotes(true); } };
+        parts.SelectionChanged += async (_, _) =>
+        {
+            if (loading || parts.SelectedItem is not Choice { Id: { } id } || id == currentPart) return;
+            loading = true;
+            try { parts.SelectedItem = parts.ItemsSource?.OfType<Choice>().FirstOrDefault(c => c.Id == currentPart); }
+            finally { loading = false; }
+            await GuardDraftChange(() => { loading = true; try { parts.SelectedItem = parts.ItemsSource?.OfType<Choice>().FirstOrDefault(c => c.Id == id); } finally { loading = false; } currentPart = null; RefreshNotes(true); }, generatorOnly: true);
+        };
         notes.SelectionChanged += (_, _) =>
         {
             if (!syncingNotes) roll.SelectMany(notes.SelectedItems?.OfType<NoteChoice>().Select(n => n.Note.Id) ?? []);
@@ -172,7 +191,7 @@ public sealed partial class MainWindow : Window
 
         record.SelectionChanged += (_, _) => { if (!loading) Try(() => { try { session.Arm((record.SelectedItem as Choice)?.Id); } finally { Reload(); } }); };
         Tip(record, "Arms the routing input with MIDI thru. Recording plays and loops the selected section; Stop commits locked notes.");
-        var takeTools = Wrap(AsyncButton("Load take", LoadTake, true), Button("Recall last", () => { session.Stop(); var take = session.Take(); RefreshTakes(take); }, true),
+        var takeTools = Wrap(AsyncButton("Load take", LoadTake, true, true), AsyncButton("Save selected", SaveSelectedTake, true, true), Button("Recall last", () => { session.Stop(); var take = session.Take(); RefreshTakes(take); }, true),
             Button("Replay", () => { if (takes.SelectedIndex < 0 || takes.SelectedIndex >= takeItems.Length) throw new InvalidOperationException("Choose a take first."); playback = "take"; replayingTake = takeItems[takes.SelectedIndex]; session.PlayTake(replayingTake); }, true));
         stoppedControls.Add(record); stoppedControls.Add(arrangement);
         workspace = new(new()
@@ -180,8 +199,9 @@ public sealed partial class MainWindow : Window
             ["Outline"] = outline, ["Patterns"] = editor,
             ["Perform"] = new ScrollViewer { Content = Column(activity, Label("Record into", record),
                 Button("Play section", PlaySection, true), Wrap(launchSection, launchBoundary, Button("Queue", QueueSection)),
-                arrangement, Label("Takes", takes), takeTools, new Expander { Header = "Bank", Content = BuildBankPane() }) }, ["Routing"] = routing
+                arrangement, Label("Takes", takes), takeHistoryHint, takeTools, new Expander { Header = "Bank", Content = BuildBankPane() }) }, ["Routing"] = routing
         });
+        workspace.AttachShortcuts(HandleShortcuts);
         Tip(launchSection, "Section to launch; choosing it does not change playback");
         Tip(launchBoundary, "Queue the section at the next bar or beat of the playing meter");
         AutomationProperties.SetName(launchSection, "Launch section"); AutomationProperties.SetName(launchBoundary, "Launch boundary");
@@ -251,13 +271,14 @@ public sealed partial class MainWindow : Window
     {
         var button = new Button { Content = title }; button.Click += (_, _) => Try(action); if (stopped) stoppedControls.Add(button); return button;
     }
-    private Button AsyncButton(string title, Func<Task> action, bool stopped = false)
+    private Button AsyncButton(string title, Func<Task> action, bool stopped = false, bool modal = false)
     {
         var button = new Button { Content = title }; button.Click += async (_, _) =>
         {
-            button.IsEnabled = false;
+            if (pendingButtons.Contains(button) || modal && (documentDialog || closePending)) return;
+            pendingButtons.Add(button); if (modal) documentDialog = true; button.IsEnabled = false;
             try { await action(); } catch (Exception ex) { status.Text = ex.Message; }
-            finally { button.IsEnabled = true; }
+            finally { pendingButtons.Remove(button); if (modal) documentDialog = false; button.IsEnabled = !stopped || !session.IsRunning; }
         }; if (stopped) stoppedControls.Add(button); return button;
     }
     private void Try(Action action)
@@ -339,7 +360,7 @@ public sealed partial class MainWindow : Window
     private Section DisplaySection => candidate ?? session.SelectedSection;
     private void UpdateCandidate()
     {
-        var progress = session.GenerationStatus; var running = session.Status().Running;
+        var progress = session.GenerationStatus; var running = session.IsRunning;
         var preparing = progress.Phase == GenerationPhase.Preparing;
         candidateTools.IsVisible = candidate is not null || preparing || session.AuditionStatus.Phase != AuditionPhase.Idle;
         candidateLabel.IsVisible = progress.Phase != GenerationPhase.Idle;
@@ -375,6 +396,7 @@ public sealed partial class MainWindow : Window
                 density.Value = o.Density; intensity.Value = o.Intensity; variation.Value = o.Variation;
                 var drums = section.Parts.FirstOrDefault(p => p.Role == PartRole.Drums)?.Pattern.Recipe;
                 if (drums?.Drummer is { } d) { drummer.SelectedIndex = (int)d.Persona + 1; ShowDrummer(d.Persona, d); } else if (drums is not null) drummer.SelectedIndex = 0;
+                loadedDrummer = CurrentDrummer();
                 loadedOutline = o;
             }
             tempo.Value = (decimal)project.Bpm;
@@ -451,7 +473,22 @@ public sealed partial class MainWindow : Window
     private void DeleteNote() => roll.DeleteSelection();
     private void TryTransport()
     {
-        try { RefreshTransport(); } catch (Exception ex) { status.Text = ex.Message; }
+        try { RefreshTransport(); }
+        catch (Exception ex)
+        {
+            // Status may retry a failed take archive. Keep recovery controls usable
+            // without retrying the archive just to determine the transport state.
+            var running = session.IsRunning;
+            foreach (var control in stoppedControls) control.IsEnabled = !running && !pendingButtons.Contains(control);
+            play.IsEnabled = !running; roll.ReadOnly = running || candidate is not null;
+            undo.IsEnabled = !running && session.CanUndo && !pendingButtons.Contains(undo);
+            redo.IsEnabled = !running && session.CanRedo && !pendingButtons.Contains(redo);
+            UpdateCandidate();
+            patternKind.IsEnabled = mute.IsEnabled = solo.IsEnabled = !running && candidate is null;
+            status.Text = ex is IOException or UnauthorizedAccessException
+                ? $"Take archive failed: {ex.Message}. Use Save take to save it elsewhere."
+                : ex.Message;
+        }
     }
     private (Section Section, double Position) PlayingPosition(SessionStatus transport)
     {
@@ -486,13 +523,13 @@ public sealed partial class MainWindow : Window
         Tip(beat, s.Running ? section.Outline.Name : "Bar and beat within the playing section");
         pulse.Update(meter, position, s.Running);
         roll.Playhead = s.Running && !playingTake && ReferenceEquals(section, DisplaySection) ? position : -1;
-        foreach (var c in stoppedControls) c.IsEnabled = !s.Running;
+        foreach (var c in stoppedControls) c.IsEnabled = !s.Running && !pendingButtons.Contains(c);
         sections.IsEnabled = !s.Running || session.Armed is null;
         play.Content = session.Armed is null ? "Play song" : "Record section";
         play.IsEnabled = !s.Running;
         Tip(play, session.Armed is null ? "Play the song order (F5 play/stop; F8 stop)" : "Record the routing input into the selected section (F5 play/stop; F8 stop)");
         roll.ReadOnly = s.Running || candidate is not null;
-        undo.IsEnabled = !s.Running && session.CanUndo; redo.IsEnabled = !s.Running && session.CanRedo;
+        undo.IsEnabled = !s.Running && session.CanUndo && !pendingButtons.Contains(undo); redo.IsEnabled = !s.Running && session.CanRedo && !pendingButtons.Contains(redo);
         if (!ReferenceEquals(candidate, session.Candidate)) { candidate = session.Candidate; RefreshNotes(); }
         UpdateCandidate();
         var auditionProgress = session.AuditionStatus;
@@ -518,9 +555,11 @@ public sealed partial class MainWindow : Window
         if (selected is not null && !archived.Contains(selected)) archived.Add(selected);
         takeItems = archived.ToArray(); takes.ItemsSource = takeItems.Select((t, i) => $"{i + 1}. {t.StartedAt:HH:mm:ss} · {t.Outputs.Length} out / {t.Inputs.Length} in{(t.Complete ? "" : " · incomplete")}").ToArray();
         takes.SelectedIndex = add is not null ? Array.IndexOf(takeItems, add) : selected is not null ? Array.IndexOf(takeItems, selected) : takeItems.Length - 1;
+        takeHistoryHint.IsVisible = session.HasOlderTakes;
     }
     private async Task Open()
     {
+        RequireStoppedForPicker();
         var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Open project", AllowMultiple = false });
         if (files.Count == 1 && files[0].TryGetLocalPath() is { } path && await ConfirmProjectReplacement())
         { session.Load(path); savedProject = session.Project; projectPath = path; candidate = null; currentPart = null; Reload(); status.Text = $"Opened {Path.GetFileName(path)}"; }
@@ -534,16 +573,31 @@ public sealed partial class MainWindow : Window
     private static readonly FilePickerFileType MidiType = new("Standard MIDI file") { Patterns = ["*.mid"] };
     private async Task LoadTake()
     {
-        var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Load take", AllowMultiple = false, FileTypeFilter = [JsonType] });
+        RequireStoppedForPicker();
+        var folder = session.TakeDirectory is { } directory && Directory.Exists(directory) ? await StorageProvider.TryGetFolderFromPathAsync(directory) : null;
+        var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Load take", AllowMultiple = false, FileTypeFilter = [JsonType], SuggestedStartLocation = folder });
         if (files.Count == 1 && files[0].TryGetLocalPath() is { } path) RefreshTakes(session.LoadTake(path));
     }
     private async Task SaveTake()
     {
-        var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Save take", SuggestedFileName = "take.json", FileTypeChoices = [JsonType, MidiType] });
-        if (file?.TryGetLocalPath() is { } path) session.SaveTake(path);
+        RequireStoppedForPicker();
+        var path = takeSavePicker is null
+            ? (await StorageProvider.SaveFilePickerAsync(new() { Title = "Save take", SuggestedFileName = "take.json", FileTypeChoices = [JsonType, MidiType] }))?.TryGetLocalPath()
+            : await takeSavePicker();
+        if (path is not null) { session.SaveTake(path); status.Text = $"Saved {Path.GetFileName(path)}"; }
     }
+    private async Task SaveSelectedTake()
+    {
+        RequireStoppedForPicker();
+        var take = SelectedTake();
+        var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Save selected take", SuggestedFileName = "take.json", FileTypeChoices = [JsonType, MidiType] });
+        if (file?.TryGetLocalPath() is { } path) session.SaveTake(path, take);
+    }
+    private PerformanceTake SelectedTake() => takes.SelectedIndex >= 0 && takes.SelectedIndex < takeItems.Length
+        ? takeItems[takes.SelectedIndex] : throw new InvalidOperationException("Choose a take first.");
     private async Task Export()
     {
+        RequireStoppedForPicker();
         var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Export song as MIDI", SuggestedFileName = "song.mid", FileTypeChoices = [MidiType] });
         if (file?.TryGetLocalPath() is { } path) session.ExportArrangementMidi(path);
     }
@@ -551,10 +605,10 @@ public sealed partial class MainWindow : Window
     {
         AutomationProperties.SetName(bankSongs, "Bank song"); AutomationProperties.SetName(bankOrder, "Bank order");
         Tip(bankSongs, "Select a saved bank song; Open loads it without starting playback");
-        var pane = Column(Label("Name", bankName), Wrap(AsyncButton("New", async () => { if (await ConfirmBankReplacement()) { session.NewBank(bankName.Text ?? "Bank"); savedBank = null; RefreshBank(); } }, true),
-            AsyncButton("Load bank", LoadBank, true), AsyncButton("Save bank", SaveBank, true)),
+        var pane = Column(Label("Name", bankName), Wrap(AsyncButton("New", async () => { if (await ConfirmBankReplacement()) { session.NewBank(bankName.Text ?? "Bank"); savedBank = null; RefreshBank(); } }, true, true),
+            AsyncButton("Load bank", LoadBank, true, true), AsyncButton("Save bank", SaveBank, true, true)),
             Label("Song", bankSongs), Wrap(Button("Add current", () => { session.AddCurrentToBank(); RefreshBank(); }, true),
-                AsyncButton("Open", async () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id && await ConfirmProjectReplacement()) { session.OpenBankSong(id); savedProject = session.Project; projectPath = null; candidate = null; currentPart = null; Reload(); } }, true),
+                AsyncButton("Open", async () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id && await ConfirmProjectReplacement()) { session.OpenBankSong(id); savedProject = session.Project; projectPath = null; candidate = null; currentPart = null; Reload(); } }, true, true),
                 Button("Update", () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id) { session.UpdateBankSong(id); RefreshBank(); } }, true)),
             Label("Set order", bankOrder), Wrap(Button("Append", () => { if (session.Bank is { } bank && (bankSongs.SelectedItem as Choice)?.Id is { } id) { session.SetBankOrder(bank.Order.Add(id)); RefreshBank(); } }, true),
                 Button("Remove", () => { if (session.Bank is { } bank && bankOrder.SelectedIndex >= 0) { session.SetBankOrder(bank.Order.RemoveAt(bankOrder.SelectedIndex)); RefreshBank(); } }, true),
@@ -582,11 +636,13 @@ public sealed partial class MainWindow : Window
     }
     private async Task LoadBank()
     {
+        RequireStoppedForPicker();
         var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Load bank", AllowMultiple = false, FileTypeFilter = [JsonType] });
         if (files.Count == 1 && files[0].TryGetLocalPath() is { } path && await ConfirmBankReplacement()) { session.LoadBank(path); savedBank = session.Bank; RefreshBank(); }
     }
     private async Task SaveBank()
     {
+        RequireStoppedForPicker();
         var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Save bank", SuggestedFileName = "bank.json", FileTypeChoices = [JsonType] });
         if (file?.TryGetLocalPath() is { } path) { session.SaveBank(path); savedBank = session.Bank; status.Text = $"Saved {Path.GetFileName(path)}"; }
     }
