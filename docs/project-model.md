@@ -6,7 +6,7 @@
 
 Each section embeds an outline and parts. The outline specifies meter, bars, root, scale, density, intensity, variation and seed. Parts own logical destinations, one-based channels, mute/solo flags and a pattern. Physical endpoints never belong to the project.
 
-Patterns are Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock. Added and recorded notes are locked. Deleting a note freezes its pattern to preserve the deletion. The pattern-kind control explicitly converts it back when regeneration is wanted. Undo/redo covers accepted project edits.
+Patterns are Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock. Recorded notes are locked. Manual field and grid additions use the visible Lock setting: it starts checked, and selecting a note loads that note's lock state. Unlocked additions can be replaced by regeneration; locked notes remain protected. Deleting a note freezes its pattern to preserve the deletion. The pattern-kind control explicitly converts it back when regeneration is wanted. Undo/redo covers accepted project edits.
 
 Recipes retain generator ID/version, PRNG, seed and settings. Configurable settings include source-note snapshots, step controls, pitch range, gate, probability, ratchets, swing, chord progression and meter grouping. Accepted notes are persisted: reopening does not require the generator or recompute notes. Unknown recipe versions cannot regenerate silently. Legacy drummer recipes retain the original algorithm; new grouped recipes preserve their version separately.
 

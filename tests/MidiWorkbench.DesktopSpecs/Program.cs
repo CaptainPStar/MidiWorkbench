@@ -34,6 +34,11 @@ internal static class Program
             AppBuilder.Configure<WorkbenchApp>().UseSkia()
                 .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).SetupWithoutStarting();
             window = new MainWindow(); window.Show(); Pump();
+            if (args.Contains("--vary-only"))
+            {
+                CheckVariationSeedFlows(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
             if (args.Contains("--lock-only") || args.Contains("--lock-field-only") || args.Contains("--lock-pointer-only"))
             {
                 CheckManualNoteLock(args.Contains("--lock-pointer-only") ? "pointer" : args.Contains("--lock-field-only") ? "field" : null);
@@ -65,6 +70,9 @@ internal static class Program
                 CheckSectionRename(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
                 SetField("closing", true); window.Close(); Pump(); return 0;
             }
+            CheckVariationSeedFlows();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
             CheckManualNoteLock();
             SetField("closing", true); window.Close(); Pump();
             window = new MainWindow(); window.Show(); Pump();
@@ -270,6 +278,37 @@ internal static class Program
         Click("Apply");
         var edited = session.SelectedSection.Parts[0].Pattern.Notes.Single(n => n.Id == "beat-precision-319");
         Check(edited.Tick == 240 && edited.Duration == 240, "Quarter-beat field edits commit 240 ticks");
+    }
+    private static void CheckVariationSeedFlows()
+    {
+        var session = Field<WorkbenchSession>("session"); var seed = Field<NumericUpDown>("seed");
+        var acceptedSeed = session.SelectedSection.Outline.Seed;
+        void VaryTo(uint expected)
+        {
+            Field<Button>("varySection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+            Until(() => session.Candidate?.Outline.Seed == expected && Field<Button>("discard").IsEnabled);
+        }
+        void Discard() { Field<Button>("discard").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump(); }
+        VaryTo(unchecked(acceptedSeed + 1)); Discard();
+        var noteButtons = Field<List<Control>>("noteEditControls");
+        var duplicate = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Duplicate") && !noteButtons.Contains(b));
+        duplicate.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(!window.OwnedWindows.Any(w => w.Title == "Unaccepted changes") && session.Project.Sections.Length == 2,
+            "Vary then Discard leaves no seed draft or duplicate-section guard");
+        acceptedSeed = session.SelectedSection.Outline.Seed;
+        VaryTo(unchecked(acceptedSeed + 1)); var first = session.Candidate;
+        VaryTo(unchecked(acceptedSeed + 2));
+        Check(!ReferenceEquals(first, session.Candidate) && session.Candidate!.Outline.Seed == unchecked(acceptedSeed + 2),
+            "Repeated Vary advances successive candidate seeds");
+        Field<Button>("accept").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(session.SelectedSection.Outline.Seed == unchecked(acceptedSeed + 2) && seed.Value == session.SelectedSection.Outline.Seed,
+            "Accept stores and displays the varied seed");
+        var manual = (decimal)session.SelectedSection.Outline.Seed + 11; seed.Value = manual;
+        VaryTo(unchecked(session.SelectedSection.Outline.Seed + 1));
+        Check(seed.Value == manual, "Vary preserves a genuinely edited seed draft");
+        Discard();
+        Check(seed.Value == manual && (bool)typeof(MainWindow).GetMethod("HasUnacceptedChanges", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, null)!,
+            "Discard preserves a genuine seed draft and its guard");
     }
     private static void CheckManualNoteLock(string? baseline = null)
     {

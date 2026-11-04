@@ -172,7 +172,7 @@ public sealed partial class MainWindow : Window
         velocity.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) roll.NewVelocity = (int)(velocity.Value ?? 90); };
         duration.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) roll.NewDuration = BeatsToTicks(duration.Value ?? .25m); };
         locked.IsCheckedChanged += (_, _) => roll.NewLocked = locked.IsChecked == true;
-        Tip(locked, "Locked notes are preserved when generative or hybrid parts regenerate.");
+        Tip(locked, "New notes use this setting. Selecting a note loads its lock state. Locked notes survive regeneration; Apply updates selected notes.");
         mute.IsCheckedChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p) Try(() => { session.SetPartMute(p.Id, mute.IsChecked == true); RefreshNotes(); }); };
         solo.IsCheckedChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p) Try(() => { session.SetPartSolo(p.Id, solo.IsChecked == true); RefreshNotes(); }); };
         patternKind.SelectionChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p && patternKind.SelectedItem is PatternKind kind) Try(() => { session.SetPatternKind(p.Id, kind); RefreshNotes(); }); };
@@ -324,7 +324,6 @@ public sealed partial class MainWindow : Window
     private Task PrepareVariationAsync()
     {
         var next = unchecked((candidate?.Outline.Seed ?? session.SelectedSection.Outline.Seed) + 1);
-        seed.Value = next;
         return PrepareAsync(() => session.PrepareVariationAsync(next));
     }
     private async Task PrepareAsync(Func<Task<Section>> prepare)
