@@ -44,8 +44,10 @@ public sealed record MidiNote(string Id, long Tick, long Duration, int Pitch, in
 public sealed record DrummerSettings(DrumPersona Persona = DrumPersona.Simple, double Complexity = .3, double Fills = .3,
     double Swing = 0, bool HalfTime = false)
 {
+    public ImmutableArray<int> Grouping { get; init; } = [];
     public void Validate()
     {
+        if (Grouping.IsDefault || Grouping.Length > 32 || Grouping.Any(g => g is < 1 or > 32)) throw new ArgumentException("Invalid meter grouping.");
         if (!Enum.IsDefined(Persona) || !double.IsFinite(Complexity) || Complexity is < 0 or > 1 ||
             !double.IsFinite(Fills) || Fills is < 0 or > 1 || !double.IsFinite(Swing) || Swing is < 0 or > .45)
             throw new ArgumentException("Drummer needs a listed persona, complexity and fills 0–1, swing 0–0.45.");
@@ -55,22 +57,30 @@ public sealed record DrummerSettings(DrumPersona Persona = DrumPersona.Simple, d
 public sealed record Recipe(string Generator, string Version, string Random, uint Seed)
 {
     public DrummerSettings? Drummer { get; init; }
+    public GeneratorSettings? Settings { get; init; }
 }
 public sealed record Pattern(string Id, PatternKind Kind, ImmutableArray<MidiNote> Notes)
 {
     public Recipe? Recipe { get; init; }
 }
-public sealed record Part(string Id, string Name, PartRole Role, string Destination, int Channel, Pattern Pattern);
+public sealed record Part(string Id, string Name, PartRole Role, string Destination, int Channel, Pattern Pattern)
+{
+    public bool Muted { get; init; }
+    public bool Solo { get; init; }
+}
 public sealed record Section(string Id, Outline Outline, ImmutableArray<Part> Parts);
 public sealed record SongProject(int SchemaVersion, string Name, double Bpm, ImmutableArray<Section> Sections)
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
+    public string Id { get; init; } = Guid.NewGuid().ToString("N");
+    public ImmutableArray<ArrangementEntry> Arrangement { get; init; } = [];
     public void Validate()
     {
         if (SchemaVersion != CurrentSchemaVersion) throw new InvalidDataException("Unsupported project schema; use a compatible application version.");
-        if (string.IsNullOrWhiteSpace(Name) || !double.IsFinite(Bpm) || Bpm is < 20 or > 400)
+        if (string.IsNullOrWhiteSpace(Id) || string.IsNullOrWhiteSpace(Name) || !double.IsFinite(Bpm) || Bpm is < 20 or > 400)
             throw new ArgumentException("Project needs a name and tempo between 20 and 400 BPM.");
         if (Sections.IsDefaultOrEmpty || Sections.Length > 128) throw new ArgumentException("Project needs 1–128 sections.");
+        if (Arrangement.IsDefault || Arrangement.Length > 1024) throw new ArgumentException("Invalid arrangement.");
         var ids = new HashSet<string>(StringComparer.Ordinal);
         foreach (var section in Sections)
         {
@@ -91,6 +101,7 @@ public sealed record SongProject(int SchemaVersion, string Name, double Bpm, Imm
                 if (part.Pattern.Recipe is { } recipe && (string.IsNullOrWhiteSpace(recipe.Generator) || string.IsNullOrWhiteSpace(recipe.Version) || string.IsNullOrWhiteSpace(recipe.Random)))
                     throw new ArgumentException("Recipe needs generator, version and random algorithm.");
                 part.Pattern.Recipe?.Drummer?.Validate();
+                part.Pattern.Recipe?.Settings?.Validate();
                 var noteIds = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var n in part.Pattern.Notes)
                 {
@@ -101,6 +112,9 @@ public sealed record SongProject(int SchemaVersion, string Name, double Bpm, Imm
                 }
             }
         }
+        foreach (var entry in Arrangement)
+            if (entry is null || !ids.Contains(entry.SectionId) || entry.Repeats is < 1 or > 128)
+                throw new ArgumentException("Arrangement refers to an unknown section or invalid repeat count.");
     }
 }
 
@@ -138,4 +152,7 @@ public sealed record PerformanceTake(int SchemaVersion, DateTimeOffset StartedAt
     ImmutableArray<TempoChange> TempoChanges)
 {
     public const int CurrentSchemaVersion = 2;
+    public Meter? Meter { get; init; }
+    public string? SourceProjectId { get; init; }
+    public string? SourceProjectName { get; init; }
 }

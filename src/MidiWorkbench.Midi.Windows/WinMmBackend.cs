@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Collections.Concurrent;
 using MidiWorkbench.Engine;
 
 namespace MidiWorkbench.Midi.Windows;
@@ -16,14 +17,22 @@ public sealed class WinMmBackend : IMidiBackend
 {
     private readonly Timer watcher;
     private string signature;
+    private readonly ConcurrentDictionary<string, WeakReference<OutputPort>> openedOutputs = new(StringComparer.Ordinal);
     public event Action? EndpointsChanged;
     public WinMmBackend()
     {
         signature = Signature();
         // Polled away from the transport worker; WinMM has no arrival/removal notification.
-        watcher = new Timer(_ =>
+        watcher = new Timer(state =>
         {
-            var next = Signature();
+            var endpoints = Endpoints();
+            var connected = endpoints.Where(e => e.Output).Select(e => e.Id).ToHashSet(StringComparer.Ordinal);
+            foreach (var (id, reference) in openedOutputs)
+            {
+                if (!reference.TryGetTarget(out var port)) openedOutputs.TryRemove(id, out _);
+                else if (!connected.Contains(id)) port.MarkDisconnected();
+            }
+            var next = string.Join("\n", endpoints.Select(e => e.Id));
             if (Interlocked.Exchange(ref signature, next) != next) EndpointsChanged?.Invoke();
         }, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
     }
@@ -51,7 +60,12 @@ public sealed class WinMmBackend : IMidiBackend
         foreach (var x in Ids(names)) if (x.Id == id) return x.Index;
         throw new MidiPortException($"'{endpointId}' is not connected.");
     }
-    public IMidiOutputPort OpenOutput(string endpointId) => new OutputPort(endpointId, Index(endpointId, "winmm-out:", Native.OutputNames()));
+    public IMidiOutputPort OpenOutput(string endpointId)
+    {
+        var port = new OutputPort(endpointId, Index(endpointId, "winmm-out:", Native.OutputNames()));
+        openedOutputs[endpointId] = new(port);
+        return port;
+    }
     public IMidiInputPort OpenInput(string endpointId, Action<TimedMidi> received) =>
         new InputPort(endpointId, Index(endpointId, "winmm-in:", Native.InputNames()), received);
     public void Dispose() => watcher.Dispose();
@@ -63,6 +77,7 @@ public sealed class WinMmBackend : IMidiBackend
         public string EndpointId { get; }
         public bool ScheduledSend => false;
         public bool Faulted => faulted;
+        public void MarkDisconnected() => faulted = true;
         public OutputPort(string id, int index)
         {
             EndpointId = id;
@@ -79,8 +94,9 @@ public sealed class WinMmBackend : IMidiBackend
         public void Cancel(double after) { }
         public void Dispose()
         {
-            if (handle == IntPtr.Zero) return;
-            _ = Native.midiOutClose(handle); handle = IntPtr.Zero;
+            faulted = true;
+            var closing = Interlocked.Exchange(ref handle, IntPtr.Zero);
+            if (closing != IntPtr.Zero) _ = Native.midiOutClose(closing);
         }
     }
 
@@ -95,7 +111,8 @@ public sealed class WinMmBackend : IMidiBackend
             EndpointId = id; this.received = received;
             callback = OnMessage; // field keeps the delegate alive for the driver
             Native.Check(Native.midiInOpen(out handle, (uint)index, Marshal.GetFunctionPointerForDelegate(callback), IntPtr.Zero, Native.CallbackFunction), "open input");
-            Native.Check(Native.midiInStart(handle), "start input");
+            try { Native.Check(Native.midiInStart(handle), "start input"); }
+            catch { _ = Native.midiInClose(handle); handle = IntPtr.Zero; throw; }
         }
         // Driver thread: timestamp on arrival and enqueue only. Driver timestamps are not yet calibrated against the host clock.
         private void OnMessage(IntPtr h, uint message, IntPtr instance, IntPtr param1, IntPtr param2)

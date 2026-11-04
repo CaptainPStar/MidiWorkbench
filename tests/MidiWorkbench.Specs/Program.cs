@@ -12,6 +12,10 @@ using MidiWorkbench.Specs;
 
 var tests = new (string Name, Action Run)[]
 {
+    ("transport regression suite", TransportRegressionSpecs.Run),
+    ("composition and recording workflow suite", WorkflowSpecs.Run),
+    ("configurable generator suite", GeneratorSpecs.Run),
+    ("end-to-end integration suite", IntegrationSpecs.Run),
     // Generation
     ("generation is deterministic", () =>
     {
@@ -130,7 +134,7 @@ var tests = new (string Name, Action Run)[]
             pattern["generatorVersion"] = "scaffold-1"; pattern["generatorSeed"] = 1;
         }
         var migrated = ProjectStore.Parse(node.ToJsonString());
-        Check(migrated.SchemaVersion == 2, "Version not migrated");
+        Check(migrated.SchemaVersion == SongProject.CurrentSchemaVersion, "Version not migrated");
         Check(migrated.Sections[0].Parts.All(p => p.Pattern.Recipe is { Generator: "scaffold", Version: "scaffold-1", Seed: 1 }), "Recipe not migrated");
         node["sections"]![0]!["parts"]![0]!["pattern"]!["unexpected"] = 1;
         Throws(() => ProjectStore.Parse(node.ToJsonString()), typeof(JsonException));

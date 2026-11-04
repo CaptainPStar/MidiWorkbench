@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using MidiWorkbench.Domain;
 
 namespace MidiWorkbench.Generation;
@@ -5,12 +6,15 @@ namespace MidiWorkbench.Generation;
 public sealed record DrumOptions(int Bars = 4, double Complexity = .3, double Intensity = .6, double Swing = 0, double FillAmount = 0,
     bool HalfTime = false, int Seed = 1, double VariationAmount = .35, DrumPersona Persona = DrumPersona.Simple)
 {
+    public ImmutableArray<int> Grouping { get; init; } = [];
+
     public void Validate()
     {
         if (Bars is < 1 or > 256 || !Enum.IsDefined(Persona) ||
             !double.IsFinite(Complexity) || Complexity is < 0 or > 1 || !double.IsFinite(Intensity) || Intensity is < 0 or > 1 ||
             !double.IsFinite(Swing) || Swing is < 0 or > .45 || !double.IsFinite(FillAmount) || FillAmount is < 0 or > 1 ||
-            !double.IsFinite(VariationAmount) || VariationAmount is < 0 or > 1)
+            !double.IsFinite(VariationAmount) || VariationAmount is < 0 or > 1 || Grouping.IsDefault ||
+            Grouping.Length > 32 || Grouping.Any(g => g is < 1 or > 32))
             throw new ArgumentOutOfRangeException(nameof(DrumOptions));
     }
 }
@@ -45,18 +49,47 @@ public static class DrumPersonas
     }
 }
 
-// General MIDI drum patterns. 4/4, 3/4 and 6/8 reproduce the original planner exactly; other meters
-// run whole quarter-note beats and drop hits past the bar end.
+// The legacy paths retain exact 4/4, 3/4 and 6/8 output. Other meters map complete
+// metrical groups onto planner beats, so an odd denominator unit is never discarded.
 public static class DrumPlanner
 {
     public const string Version = "drummer-1";
+    public const string GroupedVersion = "drummer-grouped-1";
     public const int HitTicks = 120;
 
     public static List<DrumHit> Plan(DrumOptions options, Meter meter, int variant = 0, int dynamics = 1)
     {
         options.Validate(); meter.Validate();
         if (variant is < 0 or > 7 || dynamics is < 0 or > 2) throw new ArgumentOutOfRangeException(nameof(variant));
+        var legacy = meter is { Numerator: 4, Denominator: 4 } or { Numerator: 3, Denominator: 4 } or { Numerator: 6, Denominator: 8 };
+        if (!options.Grouping.IsEmpty || !legacy) return Grouped(options, meter, variant, dynamics);
         return options.Persona == DrumPersona.Simple ? Simple(options, meter, variant, dynamics) : Persona(options, meter, variant, dynamics);
+    }
+
+    internal static List<DrumHit> PlanLegacy(DrumOptions options, Meter meter)
+    {
+        options.Validate(); meter.Validate();
+        return options.Persona == DrumPersona.Simple ? Simple(options, meter, 0, 1) : Persona(options, meter, 0, 1);
+    }
+
+    private static List<DrumHit> Grouped(DrumOptions options, Meter meter, int variant, int dynamics)
+    {
+        var groups = MeterGrouping.Resolve(meter, options.Grouping);
+        var virtualMeter = new Meter(groups.Length, 4);
+        var virtualOptions = options with { Grouping = [] };
+        var planned = options.Persona == DrumPersona.Simple ? Simple(virtualOptions, virtualMeter, variant, dynamics) : Persona(virtualOptions, virtualMeter, variant, dynamics);
+        var offsets = new long[groups.Length]; long offset = 0;
+        for (var i = 0; i < groups.Length; i++) { offsets[i] = offset; offset += groups[i] * MusicalTime.Ppq * 4L / meter.Denominator; }
+        return planned.Select(hit =>
+        {
+            var bar = hit.Tick / virtualMeter.BarTicks;
+            var local = hit.Tick % virtualMeter.BarTicks;
+            var group = (int)(local / MusicalTime.Ppq);
+            var fraction = local % MusicalTime.Ppq;
+            var width = groups[group] * MusicalTime.Ppq * 4L / meter.Denominator;
+            var tick = bar * meter.BarTicks + offsets[group] + fraction * width / MusicalTime.Ppq;
+            return hit with { Tick = tick };
+        }).DistinctBy(h => (h.Tick, h.Note)).OrderBy(h => h.Tick).ThenBy(h => h.Note).ToList();
     }
 
     private static int Velocity(DrumOptions o, double accent, int dynamics, double random) =>

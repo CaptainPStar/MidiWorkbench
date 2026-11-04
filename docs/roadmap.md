@@ -1,41 +1,32 @@
-# Implementation milestones
+# Implementation status and next gates
 
-## 0 — Validate the foundation
+## Implemented application path
 
-Linux: done (build, specs, lock files, desktop under Xvfb). Windows: open.
+Outline → prepare candidate → audition → accept/edit → arrange → perform → capture → save/reopen/replay.
 
-Restore/build on .NET 10, run specifications, test docking and file pickers on Windows, check floating-window layout recovery and shutdown. Commit real package lock files. Resolve compile/API differences before further features.
+Keyboard → loop recording → locked phrase → scoped variation of other parts → song/bank recall.
 
-Exit: all specs pass and a generated, edited project survives save/open and produces a complete memory capture. No physical timing claim.
+The implementation includes project migrations, dedicated transport, WinMM adapter, port routing, clock-only outputs, drummer and seven configurable generators, piano roll/drum grid, undo/redo, arrangement repeats, quantized section launches, live section mute/solo, take replay and bank/setlist persistence. Automated and desktop validation is recorded in [status.md](status.md).
 
-## 1 — Physical MIDI and clock
+## Hardware release gate
 
-Implemented in code (rig, transport host, WinMM, panic, faults, probe); hardware exit criteria open.
+Windows execution, real MIDI interfaces and external instruments must validate timing, sustained notes, Stop/Panic, disconnect/reconnect and long-session capture. Cross-publishing a Windows executable is not this acceptance test. Measure clock/notes under UI and CPU load before promising live-performance timing bounds.
 
-Implement device enumeration/output/input adapter with Windows MIDI Services capability detection. Add bounded scheduler command queues, ownership/retrigger policies, panic, endpoint faults, timing metrics and physical loopback harness. Replace the demonstration wait loop with measured scheduling behavior. Add rig persistence and selection.
+## Remaining recording and editing work
 
-Exit: sustained notes release, clock is measured under load, disconnect/reconnect and stop/restart behave explicitly. Only then permit hardware performance claims.
+- Streaming active takes with crash recovery, rather than bounded memory plus completed-take archives.
+- Count-in, retrospective capture and dedicated keyboard step entry.
+- Cross-loop note ties, take comping and nondestructive quantization.
+- Deletion tombstones, multi-note editing and richer conditional-note controls.
+- Asynchronous candidate preparation and acceptance during playback; current generation/editing requires Stop.
 
-## 2 — Drummer and keyboard capture
+## Broader composition and performance
 
-Implemented: drummer port, keyboard recording, thru, sustain, overdub, MIDI file export. Open: step entry, count-in, retrospective capture, hardware run.
+- Shared project-wide pattern pools and per-track clip scenes.
+- Development curves, coordinated density budgets, protected motifs and alternative comparisons.
+- Controller learn, relative encoders, pickup, macro banks and feedback.
+- Seamless multi-song setlist transitions and programmable processors.
 
-Extract/test appropriate MusicSessionTrace planner code and integrate it with shared timing. Add input recording, step entry, overdub, count-in, retrospective input/output buffers, sustain handling and SMF export with tempo mapping. Avoid routing generated output back into its own input.
+## Optional extensions
 
-Exit: keyboard phrase → playback → drummer accompaniment → captured MIDI replay works through actual devices.
-
-## 3 — Editors and structured generation
-
-Piano roll, drum grid, note conditions, probability, microtiming, arpeggiator, Euclidean and stochastic generators. Add recipe versioning, edit overrides/tombstones, undo/redo, candidate comparison, protected motifs, chord/voice-leading and development curves. Background generation and revision checks replace stopped-only editing.
-
-Exit: outline-led and performance-led paths both produce editable, reproducible material; regeneration cannot overwrite protected work.
-
-## 4 — Scenes and performance
-
-Project-wide tracks, patterns, scenes, sections, song timeline and banks/setlists. Quantized launches with cancel, note-tail/retrigger policy, coordinated transitions, macro assignments, temporary changes and controller feedback. Prepare next sections without interrupting current playback.
-
-Exit: perform a multi-section song using controllers and save/replay actual emitted events and action history.
-
-## 5 — Optional extensions
-
-Device parameter profiles (CC/NRPN/SysEx), MIDI curves, external clock following, Link, external MusicSessionTrace analysis feed, multiple playheads, density budgets and a programmable generator interface. Each requires its own acceptance tests; none blocks the initial MIDI performance workflow.
+Device parameter profiles and CC/NRPN/SysEx curves; external MIDI clock following and loss policy; Windows MIDI Services; Link; external MusicSessionTrace analysis feeds. Synthesis and audio recording remain out of scope.

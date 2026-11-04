@@ -12,15 +12,36 @@ public sealed class SectionGenerator
     private static readonly PartRole[] Generated = [PartRole.Drums, PartRole.Bass, PartRole.Pulse, PartRole.Pad];
 
     // drummer selects the drummer for drums; basicDrums selects the scaffold grid; neither keeps the existing generator.
-    public Section Generate(Outline outline, Section? previous = null, DrummerSettings? drummer = null, bool basicDrums = false)
+    public Section Generate(Outline outline, Section? previous = null, DrummerSettings? drummer = null, bool basicDrums = false,
+        IReadOnlyDictionary<string, GeneratorSettings>? generators = null, IReadOnlySet<string>? partIds = null)
     {
         outline.Validate(); drummer?.Validate();
+        var knownIds = Generated.Select(r => r.ToString().ToLowerInvariant()).Concat(previous?.Parts.Select(p => p.Id) ?? []).ToHashSet(StringComparer.Ordinal);
+        if (generators?.Keys.Any(id => !knownIds.Contains(id)) == true || partIds?.Any(id => !knownIds.Contains(id)) == true)
+            throw new ArgumentException("Generation scope contains an unknown part.");
         var parts = ImmutableArray.CreateBuilder<Part>();
         foreach (var role in Generated)
         {
             var id = role.ToString().ToLowerInvariant();
             var old = previous?.Parts.FirstOrDefault(p => p.Id == id);
-            if (old?.Pattern.Kind == PatternKind.Fixed) { parts.Add(old); continue; }
+            if (old is not null && (old.Pattern.Kind == PatternKind.Fixed || partIds is not null && !partIds.Contains(id)))
+            {
+                ValidateProtected(outline, old.Pattern); parts.Add(old); continue;
+            }
+            if (old is null && partIds is not null && !partIds.Contains(id)) continue;
+            if (generators?.TryGetValue(id, out var configured) == true)
+            {
+                parts.Add(GeneratePart(outline, old ?? DefaultPart(role, id), configured)); continue;
+            }
+            if (old?.Pattern.Recipe is { } oldRecipe)
+            {
+                if (oldRecipe.Generator == PatternGenerator.GeneratorId)
+                {
+                    PatternGenerator.ValidateRecipe(oldRecipe);
+                    parts.Add(old with { Pattern = new PatternGenerator().Generate(outline, oldRecipe.Settings!, old.Pattern) }); continue;
+                }
+                if (!(role == PartRole.Drums && (basicDrums || drummer is not null))) ValidateRecipe(oldRecipe);
+            }
             Recipe recipe;
             List<MidiNote> notes;
             var useDrummer = role == PartRole.Drums && !basicDrums &&
@@ -28,8 +49,9 @@ public sealed class SectionGenerator
             if (useDrummer)
             {
                 var settings = drummer ?? old?.Pattern.Recipe?.Drummer ?? DrumPersonas.Settings(DrumPersona.Simple);
-                recipe = new(DrummerId, DrumPlanner.Version, RandomId, outline.Seed) { Drummer = settings };
-                notes = Drums(outline, settings);
+                var legacy = drummer is null && old?.Pattern.Recipe?.Version == DrumPlanner.Version && settings.Grouping.IsEmpty;
+                recipe = new(DrummerId, legacy ? DrumPlanner.Version : DrumVersion(outline.Meter, settings), RandomId, outline.Seed) { Drummer = settings };
+                notes = Drums(outline, settings, legacy);
             }
             else
             {
@@ -44,20 +66,58 @@ public sealed class SectionGenerator
             notes.AddRange(locked);
             var pattern = new Pattern(old?.Pattern.Id ?? id, locked.Length > 0 ? PatternKind.Hybrid : PatternKind.Generative,
                 notes.OrderBy(n => n.Tick).ThenBy(n => n.Pitch).ToImmutableArray()) { Recipe = recipe };
-            parts.Add(new(id, old?.Name ?? role.ToString(), role, old?.Destination ?? role.ToString(), old?.Channel ?? (role == PartRole.Drums ? 10 : (int)role), pattern));
+            parts.Add((old ?? DefaultPart(role, id)) with { Pattern = pattern });
         }
         if (previous is not null)
-            foreach (var other in previous.Parts.Where(p => !parts.Any(created => created.Id == p.Id))) parts.Add(other);
+            foreach (var other in previous.Parts.Where(p => !parts.Any(created => created.Id == p.Id)))
+            {
+                ValidateProtected(outline, other.Pattern);
+                if (generators?.TryGetValue(other.Id, out var configured) == true && (partIds is null || partIds.Contains(other.Id)))
+                    parts.Add(GeneratePart(outline, other, configured));
+                else if (other.Pattern.Kind != PatternKind.Fixed && other.Pattern.Recipe?.Generator == PatternGenerator.GeneratorId &&
+                    (partIds is null || partIds.Contains(other.Id)))
+                {
+                    PatternGenerator.ValidateRecipe(other.Pattern.Recipe);
+                    parts.Add(other with { Pattern = new PatternGenerator().Generate(outline, other.Pattern.Recipe.Settings!, other.Pattern) });
+                }
+                else parts.Add(other);
+            }
         return new(previous?.Id ?? "section-1", outline, parts.ToImmutable());
     }
 
-    private static List<MidiNote> Drums(Outline outline, DrummerSettings s)
+    public Part GeneratePart(Outline outline, Part part, GeneratorSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(part);
+        return part with { Pattern = new PatternGenerator().Generate(outline, settings, part.Pattern) };
+    }
+
+    private static Part DefaultPart(PartRole role, string id) => new(id, role.ToString(), role, role.ToString(),
+        role == PartRole.Drums ? 10 : (int)role, new Pattern(id, PatternKind.Generative, []));
+
+    private static string DrumVersion(Meter meter, DrummerSettings settings) =>
+        settings.Grouping.IsEmpty && (meter is { Numerator: 4, Denominator: 4 } or { Numerator: 3, Denominator: 4 } or { Numerator: 6, Denominator: 8 })
+            ? DrumPlanner.Version : DrumPlanner.GroupedVersion;
+
+    private static void ValidateRecipe(Recipe recipe)
+    {
+        var supported = recipe.Random == RandomId && (recipe.Generator == ScaffoldId && recipe.Version == Version ||
+            recipe.Generator == DrummerId && (recipe.Version == DrumPlanner.Version || recipe.Version == DrumPlanner.GroupedVersion));
+        if (!supported) throw new InvalidOperationException($"Unsupported generator recipe: {recipe.Generator}/{recipe.Version}/{recipe.Random}.");
+    }
+
+    private static void ValidateProtected(Outline outline, Pattern pattern)
+    {
+        if (pattern.Notes.Any(n => n.Tick < 0 || n.Duration <= 0 || n.Tick > outline.LengthTicks || n.Duration > outline.LengthTicks - n.Tick))
+            throw new InvalidOperationException("Section is shorter than retained notes; move them first.");
+    }
+
+    private static List<MidiNote> Drums(Outline outline, DrummerSettings s, bool legacy)
     {
         var options = new DrumOptions(outline.Bars, s.Complexity, outline.Intensity, s.Swing, s.Fills, s.HalfTime,
-            unchecked((int)outline.Seed), outline.Variation, s.Persona);
+            unchecked((int)outline.Seed), outline.Variation, s.Persona) { Grouping = s.Grouping };
         var notes = new List<MidiNote>();
         var ids = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var hit in DrumPlanner.Plan(options, outline.Meter))
+        foreach (var hit in legacy ? DrumPlanner.PlanLegacy(options, outline.Meter) : DrumPlanner.Plan(options, outline.Meter))
         {
             var id = $"drums-{hit.Tick}-{hit.Note}";
             if (hit.Tick < outline.LengthTicks && ids.Add(id))

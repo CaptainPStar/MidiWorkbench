@@ -1,13 +1,13 @@
 {
   "date": "2026-11-04",
-  "sdk": "10.0.403 (linux-x64)",
-  "structural_checks": "passed",
-  "dotnet_restore": "passed (lock files committed)",
-  "dotnet_build": "passed: Release, 0 warnings",
-  "behavioral_specifications": "43/43 passed",
-  "cli_smoke_test": "passed: new, validate, upgrade, simulate, export, devices, probe loopback",
-  "desktop_smoke_test": "passed under Xvfb: launch, routing apply/reload, loop play, arm, stop",
-  "windows_build": "not run",
-  "hardware_test": "not run",
-  "projects": 9
+  "sdk": "10.0.100",
+  "platform": "linux-x64",
+  "release_build": "passed",
+  "specification_groups": 47,
+  "specification_groups_passed": 47,
+  "desktop_xvfb": "passed",
+  "independent_smf_parser": "mido",
+  "windows_cross_publish": "passed",
+  "windows_execution": "not-run",
+  "physical_midi": "not-run"
 }

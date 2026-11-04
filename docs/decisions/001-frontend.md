@@ -19,7 +19,7 @@ Start with code-first Dock documents and a central session owner. Docked/floatin
 
 ## Dependency selection
 
-Pin Avalonia.Desktop and Avalonia.Themes.Fluent 12.1.4; Dock packages 12.1.0.9. These versions were read from the current MusicSessionTrace application project. They have not been restored in this environment. Prefer upgrading only after a restore/build/UI smoke test. Generate and commit package lock files after the first successful restore; do not fabricate them.
+Pin Avalonia.Desktop and Avalonia.Themes.Fluent 12.1.4; Dock packages 12.1.0.9. These versions were read from the current MusicSessionTrace application project. These versions have been restored, release-built and exercised in the desktop smoke test. Package lock files are committed. Prefer upgrading only after a restore/build/UI smoke test.
 
 ## Sources
 

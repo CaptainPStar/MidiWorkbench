@@ -1,11 +1,12 @@
 using System.Collections.Immutable;
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using MidiWorkbench.Domain;
 
 namespace MidiWorkbench.Engine;
 
 public sealed record TransportStatus(bool Running, double Tick, double Bpm, long LateNoteOns, long SkippedClocks,
-    int Captured, bool CaptureComplete, long DroppedInputs, string? Error, long Take);
+    int Captured, bool CaptureComplete, long DroppedInputs, string? Error, long Take, bool OutputPending = false, string? ActivePlanTag = null);
 public readonly record struct CaptureEntry(double Seconds, bool Input, int Port, int Destination, byte Status, byte Data1, byte Data2);
 // Entry seconds are relative to transport start. Input port index -1 is the rig input.
 // Origin is the host-clock time of transport start.
@@ -13,12 +14,12 @@ public sealed record TransportCapture(long Take, double Origin, DateTimeOffset S
     ImmutableArray<CaptureEntry> Entries, ImmutableArray<PerformanceAction> Actions, ImmutableArray<TempoChange> TempoChanges,
     ImmutableArray<string> Endpoints, ImmutableArray<string> Destinations);
 public sealed record HostOptions(int CaptureCapacity = 100000, double LookaheadSeconds = .01, int PendingCapacity = 8192,
-    int InputCapacity = 4096, bool Background = true, IHostWait? Wait = null, Func<double>? Clock = null);
+    int InputCapacity = 4096, bool Background = true, IHostWait? Wait = null, Func<double>? Clock = null, int InputBudget = 256);
 
 // Owns the Transport and the opened output ports while playing. Callers talk to it only through bounded queues and snapshots.
 public sealed class TransportHost : IDisposable
 {
-    private enum Kind { Start, Stop, Panic, Tempo, Arm, Exit }
+    private enum Kind { Start, Stop, Panic, Tempo, Arm, QueuePlan, CancelQueuedPlan, Exit }
     private sealed record Command(Kind Kind, TaskCompletionSource Done)
     {
         public ResolvedPlan? Plan { get; init; }
@@ -27,23 +28,36 @@ public sealed class TransportHost : IDisposable
         public int Channel { get; init; }
         public double Bpm { get; init; }
         public bool Loop { get; init; }
+        public long QuantumTicks { get; init; }
+        public string? Destination { get; init; }
     }
     private readonly HostOptions options;
     private readonly Func<double> clock;
     private readonly Transport transport;
     private readonly Channel<Command> commands = Channel.CreateBounded<Command>(new BoundedChannelOptions(64) { SingleReader = true });
     private readonly Channel<TimedMidi> inputs;
+    private readonly ConcurrentQueue<Command> urgent = new();
     private readonly CaptureEntry[] entries;
     private readonly PerformanceAction[] actions = new PerformanceAction[4096];
     private readonly TempoChange[] tempos = new TempoChange[4096];
     private int entryCount, actionCount, tempoCount;
     private bool overflow;
-    private long sequence, take, droppedInputs;
+    private long takeDroppedInputs;
+    private ImmutableArray<string> captureEndpoints = [], captureDestinations = [];
+    private readonly List<TaskCompletionSource> stopWaiters = new();
+    private string? thruDestination;
+    private readonly Dictionary<(string Endpoint, byte Channel, byte Pitch), int> ownership = new();
+    private readonly Dictionary<(int Port, int Owner), (int Channel, int Pitch)> generatedOwners = new();
+    private readonly Dictionary<(int Port, int Channel, int Pitch), int> generatedCounts = new();
+    private readonly HashSet<(string Endpoint, byte Channel)> pedal = new();
+    private long sequence, take, droppedInputs, publishedSectionRevision;
     private volatile bool running;
     private ResolvedPlan? plan;
     private IMidiOutputPort[] ports = [];
-    private Queue<TimedMidi>[] pending = [];
+    private readonly record struct Pending(int Destination, TimedMidi Message, int Owner = -1);
+    private Queue<Pending>[] pending = [];
     private bool[] faulted = [];
+    private double[] scheduledUntil = [];
     private IMidiOutputPort? thru;
     private int thruChannel;
     private readonly HashSet<(byte Channel, byte Pitch)> thruHeld = new();
@@ -61,7 +75,7 @@ public sealed class TransportHost : IDisposable
         clock = this.options.Clock ?? (() => HostTime.Now);
         entries = new CaptureEntry[this.options.CaptureCapacity];
         inputs = Channel.CreateBounded<TimedMidi>(new BoundedChannelOptions(this.options.InputCapacity) { SingleReader = true });
-        transport = new(Dispatch);
+        transport = new(Dispatch, DispatchOwned);
         if (!this.options.Background) return;
         worker = new Thread(Run) { IsBackground = true, Name = "MidiWorkbench transport", Priority = ThreadPriority.Highest };
         worker.Start();
@@ -73,21 +87,36 @@ public sealed class TransportHost : IDisposable
             throw new ArgumentException("Ports do not match the plan endpoints.");
         return Post(Kind.Start, c => c with { Plan = value, Ports = outputs.ToArray(), Bpm = bpm, Loop = repeat });
     }
+    public Task QueuePlan(ResolvedPlan value, IReadOnlyList<IMidiOutputPort> outputs, long quantumTicks)
+    {
+        if (outputs.Count != value.Endpoints.Length || outputs.Where((p, i) => p.EndpointId != value.Endpoints[i]).Any())
+            throw new ArgumentException("Ports do not match the plan endpoints.");
+        return Post(Kind.QueuePlan, c => c with { Plan = value, Ports = outputs.ToArray(), QuantumTicks = quantumTicks });
+    }
+    public Task CancelQueuedPlan() => Post(Kind.CancelQueuedPlan);
     public Task Stop() => Post(Kind.Stop);
     public Task Panic() => Post(Kind.Panic);
     public Task SetTempo(double bpm) => Post(Kind.Tempo, c => c with { Bpm = bpm });
     // Thru forwards rig input to one port/channel; null disarms.
-    public Task Arm(IMidiOutputPort? port, int channel) => Post(Kind.Arm, c => c with { ThruPort = port, Channel = channel });
+    public Task Arm(IMidiOutputPort? port, int channel, string? inputEndpointId = null, string? destination = null)
+    {
+        if (port is not null && port.EndpointId == inputEndpointId) throw new ArgumentException("Input and thru output must differ.");
+        return Post(Kind.Arm, c => c with { ThruPort = port, Channel = channel, Destination = destination });
+    }
     // Driver threads call this; it never blocks.
     public void PostInput(TimedMidi message)
     {
-        if (!inputs.Writer.TryWrite(message)) Interlocked.Increment(ref droppedInputs);
+        if (!inputs.Writer.TryWrite(message)) { Interlocked.Increment(ref droppedInputs); if (running) Interlocked.Increment(ref takeDroppedInputs); }
     }
     private Task Post(Kind kind, Func<Command, Command>? configure = null)
     {
         var command = new Command(kind, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         if (configure is not null) command = configure(command);
-        if (!commands.Writer.TryWrite(command)) throw new InvalidOperationException("Transport is busy; retry.");
+        if (!commands.Writer.TryWrite(command))
+        {
+            if (kind is Kind.Stop or Kind.Panic or Kind.Exit) urgent.Enqueue(command);
+            else throw new InvalidOperationException("Transport is busy; retry.");
+        }
         return command.Done.Task;
     }
 
@@ -96,9 +125,9 @@ public sealed class TransportHost : IDisposable
         var before = Interlocked.Read(ref sequence);
         if (running || before % 2 == 1) throw new InvalidOperationException("Stop playback before reading the take.");
         var p = plan;
-        var result = new TransportCapture(Volatile.Read(ref take), origin, startedAt, startBpm, !overflow, loop, p?.LengthTicks ?? 0,
+        var result = new TransportCapture(Volatile.Read(ref take), origin, startedAt, startBpm, !overflow && Interlocked.Read(ref takeDroppedInputs) == 0, loop, p?.LengthTicks ?? 0,
             entries.AsSpan(0, Volatile.Read(ref entryCount)).ToImmutableArray(), actions.AsSpan(0, actionCount).ToImmutableArray(),
-            tempos.AsSpan(0, tempoCount).ToImmutableArray(), p?.Endpoints ?? [], p?.Destinations ?? []);
+            tempos.AsSpan(0, tempoCount).ToImmutableArray(), captureEndpoints, captureDestinations);
         if (Interlocked.Read(ref sequence) != before || running) throw new InvalidOperationException("Playback restarted while reading the take.");
         return result;
     }
@@ -106,24 +135,42 @@ public sealed class TransportHost : IDisposable
     public void Step(double now)
     {
         current = now;
-        while (commands.Reader.TryRead(out var command))
+        void Process(Command command)
         {
-            // Publish before completing so callers observe the command's effect; publish again after this step's pump.
-            try { Execute(command, now); Publish(now); dirty = true; command.Done.TrySetResult(); }
+            try
+            {
+                Execute(command, now); Publish(now); dirty = true;
+                if (command.Kind == Kind.Stop && pending.Any(q => q.Count != 0)) stopWaiters.Add(command.Done);
+                else command.Done.TrySetResult();
+            }
             catch (Exception ex) { command.Done.TrySetException(ex); }
         }
+        for (var budget = 64; budget > 0 && commands.Reader.TryRead(out var command); budget--) Process(command);
+        for (var budget = 64; budget > 0 && urgent.TryDequeue(out var command); budget--) Process(command);
         for (var i = 0; i < ports.Length; i++)
         {
-            if (!faulted[i] && ports[i].Faulted) Fault(i, "endpoint disconnected");
-            while (!faulted[i] && pending[i].TryPeek(out var m) && m.Seconds <= now) { pending[i].Dequeue(); Submit(i, m); }
+            if (!faulted[i] && NeedsPort(i, now) && ports[i].Faulted) Fault(i, "endpoint disconnected");
+            while (!faulted[i] && pending[i].TryPeek(out var item) &&
+                (item.Message.Seconds <= now || ports[i].ScheduledSend && thru?.EndpointId != ports[i].EndpointId && !IsNote(item.Message)))
+            {
+                pending[i].Dequeue();
+                var m = item.Message;
+                if (now - m.Seconds > Transport.LateLimitSeconds && IsAttackOrClock(m)) { transport.CountLate(m); continue; }
+                Submit(i, item.Destination, m, item.Owner);
+            }
         }
-        while (inputs.Reader.TryRead(out var input)) Receive(input, now);
+        for (var inputBudget = Math.Max(1, options.InputBudget); inputBudget > 0 && inputs.Reader.TryRead(out var input); inputBudget--) Receive(input, now);
         var wasRunning = transport.Running;
         transport.Pump(now, now + options.LookaheadSeconds);
         if (stopRequested) { stopRequested = false; transport.Stop(now); Act(now, "stop", "fault"); }
         else if (wasRunning && !transport.Running) Act(now, "end");
         running = transport.Running;
-        if (dirty || now - lastPublish >= .01 || running != status.Running) Publish(now);
+        if (dirty || now - lastPublish >= .01 || running != status.Running || transport.SectionRevision != publishedSectionRevision || pending.Any(q => q.Count != 0) != status.OutputPending) Publish(now);
+        if (stopWaiters.Count != 0 && !pending.Any(q => q.Count != 0))
+        {
+            foreach (var waiter in stopWaiters) waiter.TrySetResult();
+            stopWaiters.Clear();
+        }
     }
     private void Execute(Command c, double now)
     {
@@ -134,9 +181,12 @@ public sealed class TransportHost : IDisposable
                 FlushPending();
                 Interlocked.Increment(ref sequence);
                 plan = c.Plan!; ports = c.Ports; loop = c.Loop;
-                pending = ports.Select(_ => new Queue<TimedMidi>()).ToArray();
-                faulted = new bool[ports.Length];
-                entryCount = 0; actionCount = 0; tempoCount = 0; overflow = false; error = null; stopRequested = false;
+                pending = ports.Select(_ => new Queue<Pending>()).ToArray();
+                captureEndpoints = plan.Endpoints; captureDestinations = plan.Destinations;
+                if (thruDestination is not null && !captureDestinations.Contains(thruDestination)) captureDestinations = captureDestinations.Add(thruDestination);
+                if (thru is not null && !captureEndpoints.Contains(thru.EndpointId)) captureEndpoints = captureEndpoints.Add(thru.EndpointId);
+                faulted = new bool[ports.Length]; scheduledUntil = new double[ports.Length];
+                entryCount = 0; actionCount = 0; tempoCount = 0; overflow = false; Interlocked.Exchange(ref takeDroppedInputs, 0); error = null; stopRequested = false;
                 origin = now; startedAt = DateTimeOffset.UtcNow; take++;
                 tempos[tempoCount++] = new(0, c.Bpm); startBpm = c.Bpm;
                 Act(now, "start", loop ? "loop" : null);
@@ -147,8 +197,16 @@ public sealed class TransportHost : IDisposable
                 if (transport.Running) { transport.Stop(now); Act(now, "stop"); }
                 break;
             case Kind.Panic:
-                foreach (var p in ports.Where(p => p.ScheduledSend)) Try(() => p.Cancel(now));
-                foreach (var q in pending) q.Clear();
+                var cancelled = new HashSet<string>(StringComparer.Ordinal);
+                for (var i = 0; i < ports.Length; i++)
+                {
+                    if (!NeedsPort(i, now) || !ports[i].ScheduledSend || faulted[i]) continue;
+                    try { ports[i].Cancel(now); scheduledUntil[i] = now; cancelled.Add(ports[i].EndpointId); }
+                    catch (MidiPortException ex) { Fault(i, $"cancellation failed: {ex.Message}"); }
+                }
+                RemoveCancelledCapture(now, cancelled);
+                foreach (var q in pending) while (q.TryDequeue(out var item))
+                    if (IsAttackOrClock(item.Message)) transport.CountLate(item.Message);
                 var wasRunning = transport.Running;
                 transport.Panic(now);
                 ReleaseThru(now);
@@ -156,13 +214,24 @@ public sealed class TransportHost : IDisposable
                 break;
             case Kind.Tempo:
                 transport.SetTempo(now, c.Bpm);
-                if (transport.Running && tempoCount < tempos.Length) tempos[tempoCount++] = new(now - origin, c.Bpm);
+                if (transport.Running) { if (tempoCount < tempos.Length) tempos[tempoCount++] = new(transport.LastTempoChangeTime - origin, c.Bpm); else overflow = true; }
                 Act(now, "tempo", c.Bpm.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 break;
             case Kind.Arm:
+                if (c.ThruPort is not null && c.Channel is < 1 or > 16) throw new ArgumentOutOfRangeException(nameof(c.Channel));
                 ReleaseThru(now);
-                thru = c.ThruPort; thruChannel = c.Channel - 1; thruFaulted = false;
+                thru = c.ThruPort; thruChannel = c.Channel - 1; thruFaulted = false; thruDestination = c.Destination;
+                if (take > 0 && thruDestination is not null && !captureDestinations.Contains(thruDestination)) captureDestinations = captureDestinations.Add(thruDestination);
+                if (take > 0 && thru is not null && !captureEndpoints.Contains(thru.EndpointId)) captureEndpoints = captureEndpoints.Add(thru.EndpointId);
                 Act(now, "arm", thru?.EndpointId);
+                break;
+            case Kind.QueuePlan:
+                if (c.Ports.Length != ports.Length || c.Ports.Where((p, i) => !ReferenceEquals(p, ports[i])).Any())
+                    throw new ArgumentException("Queued plan must use the active port instances.");
+                transport.QueuePlan(c.Plan!, c.QuantumTicks, now); Act(now, "queue");
+                break;
+            case Kind.CancelQueuedPlan:
+                transport.CancelQueuedPlan(now); Act(now, "cancel-queue");
                 break;
             case Kind.Exit:
                 transport.Stop(now); ReleaseThru(now); FlushPending(); exit.Cancel();
@@ -171,45 +240,154 @@ public sealed class TransportHost : IDisposable
         running = transport.Running;
         dirty = true;
     }
+    private bool NeedsPort(int port, double now)
+    {
+        var id = ports[port].EndpointId;
+        return transport.NeedsPort(port) || pending[port].Count != 0 || scheduledUntil[port] > now ||
+            thru?.EndpointId == id || ownership.Keys.Any(k => k.Endpoint == id) || pedal.Any(k => k.Endpoint == id);
+    }
+    private int ThruDestinationIndex() => thruDestination is null ? -1 : captureDestinations.IndexOf(thruDestination);
     private void Receive(TimedMidi input, double now)
     {
         if (transport.Running) Record(new(input.Seconds - origin, true, -1, -1, input.Status, input.Data1, input.Data2));
         if (thru is null || thruFaulted || input.Status is < 0x80 or >= 0xF0) return;
         var kind = input.Status & 0xF0;
-        var status = (byte)(kind | thruChannel);
-        if (kind == 0x90 && input.Data2 > 0) thruHeld.Add(((byte)thruChannel, input.Data1));
-        else if (kind is 0x80 or 0x90) thruHeld.Remove(((byte)thruChannel, input.Data1));
-        try { thru.Submit(new(now, status, input.Data1, input.Data2)); }
-        catch (MidiPortException ex) { thruFaulted = true; error = $"Thru output '{thru.EndpointId}' failed: {ex.Message}"; }
+        var m = new TimedMidi(now, (byte)(kind | thruChannel), input.Data1, input.Data2);
+        var key = ((byte)thruChannel, input.Data1);
+        if (kind == 0x90 && input.Data2 > 0) { if (!thruHeld.Add(key)) return; }
+        else if (kind is 0x80 or 0x90) { if (!thruHeld.Remove(key)) return; }
+        SendOwned(thru, ThruDestinationIndex(), m, 2);
     }
     private void ReleaseThru(double now)
     {
         if (thru is not null && !thruFaulted)
-            foreach (var (channel, pitch) in thruHeld) Try(() => thru.Submit(new(now, (byte)(0x80 | channel), pitch, 0)));
+        {
+            var pedalKey = (thru.EndpointId, (byte)thruChannel);
+            if (pedal.Contains(pedalKey)) SendOwned(thru, ThruDestinationIndex(), new(now, (byte)(0xB0 | thruChannel), 64, 0), 2);
+            foreach (var (channel, pitch) in thruHeld)
+                SendOwned(thru, ThruDestinationIndex(), new(now, (byte)(0x80 | channel), pitch, 0), 2);
+        }
         thruHeld.Clear();
     }
-    private void Dispatch(int port, int destination, TimedMidi m)
+    private static bool IsNote(TimedMidi m) => (m.Status & 0xF0) is 0x80 or 0x90;
+    private static bool IsAttackOrClock(TimedMidi m) => m.Status == 0xF8 || ((m.Status & 0xF0) == 0x90 && m.Data2 > 0);
+    private void Dispatch(int port, int destination, TimedMidi m) => DispatchCore(port, destination, -1, m);
+    private void DispatchOwned(int port, int destination, int owner, TimedMidi m) => DispatchCore(port, destination, owner, m);
+    private void DispatchCore(int port, int destination, int owner, TimedMidi m)
     {
-        Record(new(m.Seconds - origin, false, port, destination, m.Status, m.Data1, m.Data2));
         if (faulted[port]) return;
-        if (ports[port].ScheduledSend || m.Seconds <= current && pending[port].Count == 0) { Submit(port, m); return; }
+        // Arbitrate notes at their deadline so live input shares the same ownership state.
+        var sharedNote = IsNote(m);
+        var liveThru = thru?.EndpointId == ports[port].EndpointId;
+        if (pending[port].Count == 0 && ((!sharedNote && !liveThru && ports[port].ScheduledSend) || m.Seconds <= current))
+        { Submit(port, destination, m, owner); return; }
         if (pending[port].Count >= options.PendingCapacity) { Fault(port, "output backlog exceeded"); return; }
-        pending[port].Enqueue(m);
+        pending[port].Enqueue(new(destination, m, owner));
     }
-    // Releases queued for an immediate port must not be dropped when the queues are replaced or the worker exits.
     private void FlushPending()
     {
         for (var i = 0; i < pending.Length; i++)
-            while (!faulted[i] && pending[i].TryDequeue(out var m)) Submit(i, m);
+            while (!faulted[i] && pending[i].TryDequeue(out var item))
+                if (!IsAttackOrClock(item.Message)) Submit(i, item.Destination, item.Message, item.Owner);
+                else transport.CountLate(item.Message);
     }
-    private void Submit(int port, TimedMidi m)
+    private void Submit(int port, int destination, TimedMidi m, int owner = -1)
     {
-        try { ports[port].Submit(m); }
-        catch (MidiPortException ex) { Fault(port, ex.Message); }
+        if (!ports[port].ScheduledSend || m.Seconds < current) m = m with { Seconds = current };
+        var kind = m.Status & 0xF0;
+        var note = (port, Channel: m.Status & 15, Pitch: (int)m.Data1);
+        var attack = kind == 0x90 && m.Data2 > 0;
+        var release = kind == 0x80 || kind == 0x90 && m.Data2 == 0;
+        if (attack && owner >= 0)
+        {
+            if (!generatedOwners.TryAdd((port, owner), (note.Channel, note.Pitch))) return;
+            generatedCounts.TryGetValue(note, out var count);
+            generatedCounts[note] = count + 1;
+            if (count != 0) return;
+        }
+        else if (release && owner >= 0)
+        {
+            if (!generatedOwners.TryGetValue((port, owner), out var key) || key != (note.Channel, note.Pitch)) return;
+            generatedOwners.Remove((port, owner));
+            var remaining = generatedCounts[note] - 1;
+            if (remaining > 0) { generatedCounts[note] = remaining; return; }
+            generatedCounts.Remove(note);
+        }
+        else if (release)
+        {
+            foreach (var key in generatedOwners.Where(x => x.Key.Port == port && x.Value == (note.Channel, note.Pitch)).Select(x => x.Key).ToArray())
+                generatedOwners.Remove(key);
+            generatedCounts.Remove(note);
+        }
+        SendOwned(ports[port], destination, m, 1, port);
+    }
+    private void SendOwned(IMidiOutputPort output, int destination, TimedMidi m, int owner, int port = -1)
+    {
+        var kind = m.Status & 0xF0;
+        var key = (output.EndpointId, (byte)(m.Status & 15), m.Data1);
+        ownership.TryGetValue(key, out var owners);
+        var attack = kind == 0x90 && m.Data2 > 0;
+        var release = kind == 0x80 || kind == 0x90 && m.Data2 == 0;
+        if (attack) { ownership[key] = owners | owner; if (owners != 0) return; }
+        if (release)
+        {
+            if ((owners & owner) == 0) return;
+            owners &= ~owner;
+            if (owners != 0) { ownership[key] = owners; return; }
+            ownership.Remove(key);
+        }
+        if (kind == 0xB0 && m.Data1 == 64)
+        {
+            var pedalKey = (output.EndpointId, (byte)(m.Status & 15));
+            if (m.Data2 >= 64) pedal.Add(pedalKey); else pedal.Remove(pedalKey);
+        }
+        try
+        {
+            output.Submit(m);
+            if (port >= 0 && output.ScheduledSend && m.Seconds > current)
+                scheduledUntil[port] = Math.Max(scheduledUntil[port], m.Seconds);
+            if (take > 0 && (owner != 2 || transport.Running || running))
+            {
+                var index = captureEndpoints.IndexOf(output.EndpointId);
+                if (index >= 0) Record(new(m.Seconds - origin, false, index, destination, m.Status, m.Data1, m.Data2));
+            }
+        }
+        catch (MidiPortException ex)
+        {
+            if (port >= 0) { if (!faulted[port]) Fault(port, ex.Message); }
+            else { thruFaulted = true; error = $"Thru output '{output.EndpointId}' failed: {ex.Message}"; }
+        }
+    }
+    private void RemoveCancelledCapture(double now, HashSet<string> cancelled)
+    {
+        var write = 0;
+        for (var read = 0; read < entryCount; read++)
+        {
+            var e = entries[read];
+            if (!e.Input && e.Seconds > now - origin && e.Port >= 0 && e.Port < captureEndpoints.Length &&
+                cancelled.Contains(captureEndpoints[e.Port])) continue;
+            entries[write++] = e;
+        }
+        entryCount = write;
     }
     private void Fault(int port, string message)
     {
-        faulted[port] = true; pending[port].Clear();
+        // A host backlog is not necessarily a broken device: release notes already submitted.
+        var output = ports[port];
+        faulted[port] = true;
+        foreach (var key in pedal.Where(k => k.Endpoint == output.EndpointId).ToArray())
+            SendOwned(output, -1, new(current, (byte)(0xB0 | key.Channel), 64, 0), 1, port);
+        foreach (var key in ownership.Keys.Where(k => k.Endpoint == output.EndpointId).ToArray())
+        {
+            var owners = ownership[key];
+            if ((owners & 1) != 0) SendOwned(output, -1, new(current, (byte)(0x80 | key.Channel), key.Pitch, 0), 1, port);
+            if ((owners & 2) != 0) SendOwned(output, -1, new(current, (byte)(0x80 | key.Channel), key.Pitch, 0), 2, port);
+        }
+        foreach (var key in generatedOwners.Keys.Where(k => k.Port == port).ToArray()) generatedOwners.Remove(key);
+        foreach (var key in generatedCounts.Keys.Where(k => k.Port == port).ToArray()) generatedCounts.Remove(key);
+        faulted[port] = true;
+        while (pending[port].TryDequeue(out var item)) if (IsAttackOrClock(item.Message)) transport.CountLate(item.Message);
+        overflow = true;
         error = $"Output '{ports[port].EndpointId}' failed: {message}. Reconnect it and press Play.";
         stopRequested = true;
         Act(current, "fault", ports[port].EndpointId);
@@ -221,17 +399,13 @@ public sealed class TransportHost : IDisposable
     }
     private void Act(double now, string kind, string? value = null)
     {
-        if (actionCount < actions.Length) actions[actionCount++] = new(now - origin, kind, value);
-    }
-    private static void Try(Action action)
-    {
-        try { action(); } catch (MidiPortException) { }
+        if (actionCount < actions.Length) actions[actionCount++] = new(now - origin, kind, value); else overflow = true;
     }
     private void Publish(double now)
     {
-        lastPublish = now; dirty = false;
+        lastPublish = now; dirty = false; publishedSectionRevision = transport.SectionRevision;
         Volatile.Write(ref status, new(transport.Running, transport.Position(now), transport.Bpm, transport.LateNoteOns, transport.SkippedClocks,
-            entryCount, !overflow, Interlocked.Read(ref droppedInputs), error, take));
+            entryCount, !overflow && Interlocked.Read(ref takeDroppedInputs) == 0, Interlocked.Read(ref droppedInputs), error, take, pending.Any(q => q.Count != 0), transport.ActivePlanTag));
     }
     private void Run()
     {
@@ -250,14 +424,18 @@ public sealed class TransportHost : IDisposable
     }
     public void Dispose()
     {
-        if (worker is null) { Step(clock()); transport.Stop(clock()); ReleaseThru(clock()); FlushPending(); }
+        if (worker == Thread.CurrentThread)
+        {
+            transport.Stop(clock()); ReleaseThru(clock()); FlushPending(); exit.Cancel();
+            return;
+        }
+        if (worker is null) { Step(clock()); transport.Stop(clock()); ReleaseThru(clock()); FlushPending(); foreach (var waiter in stopWaiters) waiter.TrySetResult(); stopWaiters.Clear(); }
         else if (!exit.IsCancellationRequested)
         {
             try { Post(Kind.Exit); } catch (InvalidOperationException) { exit.Cancel(); }
             if (!worker.Join(TimeSpan.FromSeconds(2))) exit.Cancel();
             worker.Join(TimeSpan.FromSeconds(2));
         }
-        options.Wait?.Dispose();
-        exit.Dispose();
+        if (worker is null || !worker.IsAlive) { options.Wait?.Dispose(); exit.Dispose(); }
     }
 }

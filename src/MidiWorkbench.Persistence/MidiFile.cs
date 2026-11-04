@@ -9,14 +9,19 @@ public sealed record SmfTrack(string Name, IReadOnlyList<SmfEvent> Events);
 public static class MidiFile
 {
     public static byte[] Build(Meter meter, IEnumerable<(long Tick, double Bpm)> tempo, IReadOnlyList<SmfTrack> tracks)
+        => Build([(0L, meter)], tempo, tracks);
+
+    public static byte[] Build(IEnumerable<(long Tick, Meter Meter)> meters, IEnumerable<(long Tick, double Bpm)> tempo, IReadOnlyList<SmfTrack> tracks)
     {
         if (tracks.Count > 1000) throw new ArgumentException("Too many tracks.");
         using var file = new MemoryStream();
         file.Write("MThd"u8); BigEndian(file, 6, 4); BigEndian(file, 1, 2); BigEndian(file, tracks.Count + 1, 2); BigEndian(file, MusicalTime.Ppq, 2);
-        var conductor = new List<(long Tick, byte[] Bytes)>
+        var conductor = new List<(long Tick, byte[] Bytes)>();
+        foreach (var (tick, meter) in meters)
         {
-            (0, [0xFF, 0x58, 4, (byte)meter.Numerator, (byte)Math.Log2(meter.Denominator), 24, 8])
-        };
+            meter.Validate();
+            conductor.Add((Math.Max(0, tick), [0xFF, 0x58, 4, (byte)meter.Numerator, (byte)Math.Log2(meter.Denominator), 24, 8]));
+        }
         foreach (var (tick, bpm) in tempo)
         {
             var micros = (int)Math.Round(60_000_000 / bpm);

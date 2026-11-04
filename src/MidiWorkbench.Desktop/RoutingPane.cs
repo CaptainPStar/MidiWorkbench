@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Automation;
 using Avalonia.Layout;
 using MidiWorkbench.Application;
 using MidiWorkbench.Domain;
@@ -47,25 +48,30 @@ internal sealed class RoutingPane : ScrollViewer
             var endpoint = new ComboBox { ItemsSource = outputs, MinWidth = 220, HorizontalAlignment = HorizontalAlignment.Stretch,
                 SelectedItem = outputs.FirstOrDefault(o => o.Id == route?.EndpointId) };
             var channel = new ComboBox { ItemsSource = channelChoices, SelectedItem = channelChoices.First(c => c.Id == route?.Channel?.ToString()) };
+            AutomationProperties.SetName(endpoint, $"Output for {destination}");
+            AutomationProperties.SetName(channel, $"Channel for {destination}");
             ToolTip.SetTip(channel, "Part uses the channel stored in the song");
             AddRow(grid, row++, new TextBlock { Text = destination, VerticalAlignment = VerticalAlignment.Center }, endpoint, channel);
             routes.Add((destination, endpoint, channel));
         }
         body.Children.Add(grid);
 
-        var used = rig.Endpoints.ToArray();
-        if (used.Length > 0)
+        if (outputs.Length > 0)
         {
             var settings = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto"), ColumnSpacing = 8, RowSpacing = 6, Margin = new Thickness(0, 12, 0, 0) };
             AddRow(settings, 0, new TextBlock { Text = "Output" }, new TextBlock { Text = "Clock" }, new TextBlock { Text = "Delay ms" });
             row = 1;
-            foreach (var e in used)
+            foreach (var output in outputs)
             {
-                var clock = new CheckBox { IsChecked = e.SendClock };
-                var offset = new NumericUpDown { Minimum = 0, Maximum = 100, Increment = 1, Value = (decimal)e.OffsetMilliseconds, Width = 110 };
+                var e = rig.Endpoints.FirstOrDefault(e => e.Id == output.Id);
+                var clock = new CheckBox { IsChecked = e?.SendClock == true };
+                ToolTip.SetTip(clock, "Send MIDI clock to this output, including outputs with no note routes");
+                AutomationProperties.SetName(clock, $"Clock to {output.Label}");
+                var offset = new NumericUpDown { Minimum = 0, Maximum = 100, Increment = 1, Value = (decimal)(e?.OffsetMilliseconds ?? 0), Width = 110 };
+                AutomationProperties.SetName(offset, $"Delay for {output.Label}");
                 ToolTip.SetTip(offset, "Delays everything sent to this output");
-                AddRow(settings, row++, new TextBlock { Text = Label(e.Id), VerticalAlignment = VerticalAlignment.Center }, clock, offset);
-                endpoints.Add((e.Id, clock, offset));
+                AddRow(settings, row++, new TextBlock { Text = output.Label, VerticalAlignment = VerticalAlignment.Center }, clock, offset);
+                endpoints.Add((output.Id!, clock, offset));
             }
             body.Children.Add(settings);
         }
@@ -73,6 +79,7 @@ internal sealed class RoutingPane : ScrollViewer
         var inputs = new[] { new Choice(null, "None") }.Concat(available.Where(e => e.Input).Select(e => e.Id)
             .Union(rig.Input is null ? [] : [rig.Input]).Select(id => new Choice(id, Label(id)))).ToArray();
         input = new ComboBox { ItemsSource = inputs, MinWidth = 220, SelectedItem = inputs.First(i => i.Id == rig.Input) };
+        AutomationProperties.SetName(input, "Recording input");
         ToolTip.SetTip(input, "Keyboard for recording and thru");
         body.Children.Add(new StackPanel { Spacing = 4, Margin = new Thickness(0, 12, 0, 0), Children = { new TextBlock { Text = "Input" }, input } });
 
@@ -88,7 +95,7 @@ internal sealed class RoutingPane : ScrollViewer
             var routeList = routes.Where(r => r.Endpoint.SelectedItem is Choice { Id: not null })
                 .Select(r => new DeviceRoute(r.Destination, ((Choice)r.Endpoint.SelectedItem!).Id!,
                     r.Channel.SelectedItem is Choice { Id: { } c } ? int.Parse(c) : null)).ToImmutableArray();
-            var endpointList = routeList.Select(r => r.EndpointId).Distinct(StringComparer.Ordinal).Select(id =>
+            var endpointList = routeList.Select(r => r.EndpointId).Concat(endpoints.Where(e => e.Clock.IsChecked == true).Select(e => e.Id)).Distinct(StringComparer.Ordinal).Select(id =>
             {
                 var existing = endpoints.FirstOrDefault(e => e.Id == id);
                 return existing.Id is null ? new RigEndpoint(id)

@@ -5,7 +5,11 @@ import re
 import xml.etree.ElementTree as ET
 
 root = Path(__file__).resolve().parents[1]
-projects = list(root.rglob('*.csproj'))
+excluded = {'.git', 'bin', 'obj', 'artifacts'}
+def source_files(pattern):
+    return [p for p in root.rglob(pattern) if not excluded.intersection(p.relative_to(root).parts)]
+
+projects = source_files('*.csproj')
 packages = {p.attrib['Include'] for p in ET.parse(root/'Directory.Packages.props').iter('PackageVersion')}
 for project in projects:
     tree = ET.parse(project)
@@ -17,9 +21,9 @@ for item in ET.parse(root/'MidiWorkbench.slnx').iter('Project'):
     assert (root/item.attrib['Path']).is_file(), item.attrib
 for file in [root/'Directory.Build.props', root/'Directory.Packages.props']:
     ET.parse(file)
-for file in root.rglob('*.json'):
+for file in source_files('*.json'):
     json.loads(file.read_text())
-for file in root.rglob('*.md'):
+for file in source_files('*.md'):
     for url in re.findall(r'\]\(([^)]+)\)', file.read_text()):
         if '://' not in url and not url.startswith('#'):
             assert (file.parent/url.split('#')[0]).exists(), (file, url)

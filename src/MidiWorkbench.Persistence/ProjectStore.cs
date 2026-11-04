@@ -21,8 +21,9 @@ public static class ProjectStore
     {
         var root = JsonNode.Parse(json) as JsonObject ?? throw new InvalidDataException("Project is empty.");
         var version = root["schemaVersion"]?.GetValue<int>() ?? throw new InvalidDataException("Project has no schema version.");
-        if (version == 1) Migrate1To2(root);
-        else if (version != SongProject.CurrentSchemaVersion) throw new InvalidDataException($"Project schema {version} is not supported by this version.");
+        if (version == 1) { Migrate1To2(root); version = 2; }
+        if (version == 2) { root["schemaVersion"] = SongProject.CurrentSchemaVersion; version = SongProject.CurrentSchemaVersion; }
+        if (version != SongProject.CurrentSchemaVersion) throw new InvalidDataException($"Project schema {version} is not supported by this version.");
         var project = root.Deserialize<SongProject>(JsonOptions) ?? throw new InvalidDataException("Project is empty.");
         project.Validate(); return project;
     }
@@ -39,13 +40,47 @@ public static class ProjectStore
             if (generator is not null)
                 pattern["recipe"] = new JsonObject { ["generator"] = "scaffold", ["version"] = generator, ["random"] = "xorshift32", ["seed"] = seed ?? 0 };
         }
-        root["schemaVersion"] = SongProject.CurrentSchemaVersion;
+        root["schemaVersion"] = 2;
     }
     public static void Save(string path, SongProject project)
     {
         project.Validate(); WriteAtomic(path, JsonSerializer.Serialize(project, JsonOptions));
     }
-    public static void SaveTake(string path, PerformanceTake take) => WriteAtomic(path, JsonSerializer.Serialize(take, JsonOptions));
+    public static void SaveTake(string path, PerformanceTake take)
+    {
+        ValidateTake(take); WriteAtomic(path, JsonSerializer.Serialize(take, JsonOptions));
+    }
+    public static PerformanceTake LoadTake(string path)
+    {
+        var take = JsonSerializer.Deserialize<PerformanceTake>(ReadLimited(path), JsonOptions) ?? throw new InvalidDataException("Take is empty.");
+        ValidateTake(take); return take;
+    }
+    public static void ValidateTake(PerformanceTake take)
+    {
+        if (take.SchemaVersion != PerformanceTake.CurrentSchemaVersion) throw new InvalidDataException("Unsupported take schema.");
+        if (!double.IsFinite(take.Bpm) || take.Bpm is < 20 or > 400 || take.Outputs.IsDefault || take.Inputs.IsDefault || take.Actions.IsDefault || take.TempoChanges.IsDefault || take.Outputs.Length + take.Inputs.Length > 1000000) throw new InvalidDataException("Invalid take.");
+        take.Meter?.Validate();
+        foreach (var e in take.Outputs.Concat(take.Inputs))
+            if (e is null || !double.IsFinite(e.Seconds) || e.Seconds < 0 || string.IsNullOrWhiteSpace(e.Endpoint) || e.Data1 > 127 || e.Data2 > 127 || e.Status < 0x80) throw new InvalidDataException("Invalid captured MIDI.");
+        foreach (var a in take.Actions) if (a is null || !double.IsFinite(a.Seconds) || a.Seconds < 0 || string.IsNullOrWhiteSpace(a.Kind)) throw new InvalidDataException("Invalid take action.");
+        foreach (var t in take.TempoChanges) if (t is null || !double.IsFinite(t.Seconds) || t.Seconds < 0 || !double.IsFinite(t.Bpm) || t.Bpm is < 20 or > 400) throw new InvalidDataException("Invalid take tempo.");
+    }
+    public static void SaveBank(string path, SongBank bank)
+    {
+        bank.Validate(); WriteAtomic(path, JsonSerializer.Serialize(bank, JsonOptions));
+    }
+    public static SongBank LoadBank(string path)
+    {
+        var root = JsonNode.Parse(ReadLimited(path)) as JsonObject ?? throw new InvalidDataException("Bank is empty.");
+        if (root["schemaVersion"]?.GetValue<int>() != SongBank.CurrentSchemaVersion) throw new InvalidDataException("Unsupported bank schema.");
+        foreach (var song in root["songs"]?.AsArray() ?? [])
+        {
+            var value = song?["project"] ?? throw new InvalidDataException("Bank song has no project.");
+            song!["project"] = JsonSerializer.SerializeToNode(Parse(value.ToJsonString()), JsonOptions);
+        }
+        var bank = root.Deserialize<SongBank>(JsonOptions) ?? throw new InvalidDataException("Bank is empty.");
+        bank.Validate(); return bank;
+    }
     public static Rig LoadRig(string path)
     {
         var rig = JsonSerializer.Deserialize<Rig>(ReadLimited(path), JsonOptions) ?? throw new InvalidDataException("Rig is empty.");
