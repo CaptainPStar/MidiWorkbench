@@ -30,6 +30,7 @@ public interface IMidiOutputPort : IDisposable
 public interface IMidiInputPort : IDisposable
 {
     string EndpointId { get; }
+    bool Faulted => false;
 }
 
 public interface IHostWait : IDisposable

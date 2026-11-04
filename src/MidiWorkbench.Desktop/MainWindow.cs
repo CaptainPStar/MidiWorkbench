@@ -15,9 +15,9 @@ using MidiWorkbench.Persistence;
 
 namespace MidiWorkbench.Desktop;
 
-public sealed class MainWindow : Window
+public sealed partial class MainWindow : Window
 {
-    private static readonly string Settings = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData,
+    private static readonly string Settings = Environment.GetEnvironmentVariable("MIDIWORKBENCH_SETTINGS_DIRECTORY") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData,
         Environment.SpecialFolderOption.Create), "MidiWorkbench");
     private readonly WorkbenchSession session;
     private readonly DockWorkspace workspace;
@@ -50,10 +50,12 @@ public sealed class MainWindow : Window
         snap = new() { ItemsSource = new[] { "1/4", "1/8", "1/16", "1/32", "1/8T", "1/16T", "Off" }, SelectedIndex = 2 };
     private readonly Slider zoom = new() { Minimum = 24, Maximum = 240, Value = 96, Width = 110 };
     private readonly ListBox notes = new() { MaxHeight = 130, SelectionMode = SelectionMode.Multiple };
-    private readonly NumericUpDown pitch = Number(0, 127, 60), velocity = Number(1, 127, 90), tick = Number(0, 1000000000, 0), duration = Number(1, 1000000000, 240);
+    private readonly NumericUpDown pitch = Number(0, 127, 60), velocity = Number(1, 127, 90), tick = Number(1, 1000001, 1), duration = Number(1m / MusicalTime.Ppq, 1000000, .25m);
     private readonly List<Control> stoppedControls = new();
+    private readonly List<Control> noteEditControls = new();
     private readonly Button play, undo, redo, accept, discard, audition, returnAudition, cancelGeneration, prepareSection, varySection, cancelQueued;
     private readonly ComboBox candidateBoundary = new() { ItemsSource = new[] { "Bar", "Beat" }, SelectedIndex = 0 };
+    private readonly Control candidateTools;
     private readonly string layout = Path.Combine(Settings, "layout.json");
     private Section? candidate;
     private PerformanceTake[] takeItems = [];
@@ -64,26 +66,34 @@ public sealed class MainWindow : Window
     private Section? auditionSection;
     private PerformanceTake? replayingTake;
     private GeneratorSettings? loadedGeneratorSettings;
+    private Outline? loadedOutline;
 
     public MainWindow()
     {
         Title = "MidiWorkbench"; Width = 1380; Height = 900; MinWidth = 1000; MinHeight = 650;
+        tick.Increment = duration.Increment = .25m;
+        tick.FormatString = duration.FormatString = "0.####";
+        Tip(tick, "Start in quarter-note beats, counted from 1. One quarter note is 960 ticks; snap is set separately.");
+        Tip(duration, "Length in quarter-note beats. 0.25 is a sixteenth note, in any meter.");
         var backend = WindowsMidi.CreateBackend() is { } windows ? new CompositeBackend(new MemoryBackend(), windows) : (IMidiBackend)new MemoryBackend();
         session = new(new SessionOptions(backend, Path.Combine(Settings, "rig.json"), new HostOptions(Wait: WindowsMidi.CreateWait()), Path.Combine(Settings, "takes")));
-        routing = new(session, ex => { status.Text = ex?.Message ?? ""; if (ex is null) Reload(); });
+        savedProject = session.Project;
+        routing = new(session, ex => { status.Text = ex?.Message ?? "Routing applied."; if (ex is null) Reload(); });
         arrangement = new(session, action => Try(() => { action(); ClearCandidate(); Reload(); }));
-        session.EndpointsChanged += () => Dispatcher.UIThread.Post(routing.Rebuild);
-        var panic = Button("Panic", () => { session.Panic(); Reload(); }); Tip(panic, "Release notes immediately and send All Notes Off");
+        session.EndpointsChanged += () => Dispatcher.UIThread.Post(() => { if (!closing) { routing.Rebuild(preserveDraft: true); RefreshOutputStatus(); } });
+        var panic = Button("Panic", () => { session.Panic(); Reload(); }); Tip(panic, "Release notes and pedals immediately (Ctrl+Shift+Space)");
+        panic.Classes.Add("danger");
         undo = Button("Undo", () => { session.Undo(); ClearCandidate(); Reload(); }, true);
         redo = Button("Redo", () => { session.Redo(); ClearCandidate(); Reload(); }, true);
         Tip(undo, "Undo the last project edit (Ctrl+Z)"); Tip(redo, "Redo the last undone edit (Ctrl+Shift+Z)");
-        play = Button("Play song", () => { playback = session.Armed is null ? "song" : "section"; auditionSection = session.SelectedSection; if (session.Armed is null) session.StartArrangement(loop.IsChecked == true); else session.StartSection(session.SelectedSectionId, loop.IsChecked == true); });
+        play = Button("Play song", StartSong);
+        play.Classes.Add("primary");
         cancelQueued = Button("Cancel queue", session.CancelQueuedSection);
-        var transport = Row(play,
+        var transport = Wrap(play,
             Button("Stop", () => { session.Stop(); Reload(); RefreshTakes(); }), panic, loop, Label("BPM", tempo),
             Button("Set", () => session.SetTempo((double)(tempo.Value ?? 120))), beat, pulse, queuedStatus, cancelQueued);
         Tip(loop, "Repeat the current playback range"); Tip(tempo, "Quarter-note beats per minute");
-        var files = Row(AsyncButton("Open", Open, true), AsyncButton("Save", Save), AsyncButton("Save take", SaveTake, true),
+        var files = Wrap(AsyncButton("Open", Open, true), AsyncButton("Save", Save), AsyncButton("Save as", SaveAs), AsyncButton("Save take", SaveTake, true),
             AsyncButton("Export MIDI", Export), undo, redo);
 
         sections.SelectionChanged += (_, _) => { if (!loading && sections.SelectedItem is Choice { Id: { } id }) Try(() => { session.SelectSection(id); ClearCandidate(); currentPart = null; Reload(); }); };
@@ -95,21 +105,30 @@ public sealed class MainWindow : Window
         drummer.SelectionChanged += (_, _) => { if (!loading && drummer.SelectedIndex > 0) ShowDrummer(DrumPersonas.All[drummer.SelectedIndex - 1].Id, null); };
         Tip(complexity, "Drum activity; other parts use density");
         accept = Button("Accept", AcceptCandidate);
+        accept.Classes.Add("primary");
         discard = Button("Discard", () => { ClearCandidate(); RefreshNotes(); });
         audition = Button("Audition", AuditionCandidate);
         returnAudition = Button("Return", () => session.ReturnFromAudition(CandidateQuantum()));
         cancelGeneration = Button("Cancel preparation", session.CancelGeneration);
         prepareSection = AsyncButton("Preview section", PrepareSectionAsync);
+        prepareSection.Classes.Add("primary");
         varySection = AsyncButton("Vary", PrepareVariationAsync);
         Tip(varySection, "Vary the accepted section with the next seed. Use Preview section to apply edited outline controls.");
         Tip(candidateBoundary, "Boundary for live audition, return or acceptance");
         AutomationProperties.SetName(candidateBoundary, "Candidate boundary");
         Tip(accept, "Commit the candidate. During playback, queue it at the chosen boundary. Cancelling a queued launch does not undo the accepted edit.");
-        var outline = Column(Label("Sections", sections), sectionTools, Label("Name", sectionName), Label("Bars", bars), Label("Meter", Row(numerator, denominator)),
-            Label("Root", root), Label("Scale", scale), Label("Density", density), Label("Intensity", intensity), Label("Variation", variation), Label("Seed", seed),
+        var outlineSettings = Column(Label("Sections", sections), sectionTools,
+            new Expander { Header = "Section settings", IsExpanded = true, Content = Column(new TextBlock { Text = "Apply changes with Preview section, then Accept.", TextWrapping = Avalonia.Media.TextWrapping.Wrap }, Label("Name", sectionName),
+                Wrap(Label("Bars", bars), Label("Meter", Wrap(numerator, denominator))),
+                Wrap(PitchLabel("Root note", root), Label("Seed", seed)), Label("Scale intervals", scale),
+                AmountLabel("Density", density), AmountLabel("Intensity", intensity), AmountLabel("Variation", variation)) },
             new Expander { Header = "Drummer", Content = Column(Label("Persona", drummer), Label("Complexity", complexity), Label("Fills", fills), Label("Swing", swing), halfTime) },
-            Wrap(prepareSection, varySection, cancelGeneration),
-            candidateLabel, Wrap(candidateBoundary, audition, returnAudition, accept, discard), new Expander { Header = "Part generator", Content = generators });
+            new Expander { Header = "Part generator", Content = generators });
+        var outline = new Grid { RowDefinitions = new RowDefinitions("*,Auto") };
+        outline.Children.Add(new ScrollViewer { Content = outlineSettings });
+        candidateTools = Wrap(candidateBoundary, audition, returnAudition, accept, discard);
+        var candidateActions = Column(Wrap(prepareSection, varySection, cancelGeneration), candidateLabel, candidateTools);
+        Grid.SetRow(candidateActions, 1); outline.Children.Add(candidateActions);
         Tip(scale, "Pitch-class intervals from the root, separated by commas");
         generators.Error += ex => status.Text = ex.Message;
         generators.Prepare = PreparePartAsync;
@@ -126,7 +145,7 @@ public sealed class MainWindow : Window
         snap.SelectionChanged += (_, _) => roll.SnapTicks = snap.SelectedIndex switch { 0 => 960, 1 => 480, 2 => 240, 3 => 120, 4 => 320, 5 => 160, _ => 1 };
         zoom.PropertyChanged += (_, e) => { if (e.Property == Slider.ValueProperty) roll.Zoom = zoom.Value; };
         velocity.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) roll.NewVelocity = (int)(velocity.Value ?? 90); };
-        duration.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) roll.NewDuration = (long)(duration.Value ?? 240); };
+        duration.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) roll.NewDuration = BeatsToTicks(duration.Value ?? .25m); };
         mute.IsCheckedChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p) Try(() => { session.SetPartMute(p.Id, mute.IsChecked == true); RefreshNotes(); }); };
         solo.IsCheckedChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p) Try(() => { session.SetPartSolo(p.Id, solo.IsChecked == true); RefreshNotes(); }); };
         patternKind.SelectionChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p && patternKind.SelectedItem is PatternKind kind) Try(() => { session.SetPatternKind(p.Id, kind); RefreshNotes(); }); };
@@ -139,12 +158,14 @@ public sealed class MainWindow : Window
         var editor = new Grid { RowDefinitions = new RowDefinitions("Auto,*,Auto,Auto,Auto"), Margin = new Thickness(8) };
         editor.Children.Add(Wrap(parts, mode, Label("Snap", snap), Label("Zoom", zoom), mute, solo, patternKind));
         Grid.SetRow(rollScroll, 1); editor.Children.Add(rollScroll);
-        var fields = Wrap(Label("Pitch", pitch), Label("Velocity", velocity), Label("Tick", tick), Label("Duration", duration), locked);
+        var fields = Wrap(PitchLabel("Pitch", pitch), Label("Velocity", velocity), Label("Start beat", tick), Label("Length (beats)", duration), locked);
         Grid.SetRow(fields, 2); editor.Children.Add(fields);
         var apply = Button("Apply", ApplyNote, true);
         Tip(apply, "For a selection, pitch/tick/duration changes are relative. Velocity and lock apply to all selected notes.");
         var edits = Wrap(apply, Button("Add note", AddNote, true), Button("Delete", DeleteNote, true),
             Button("All", roll.SelectAll), Button("Copy", roll.Copy), Button("Paste", roll.Paste, true), Button("Duplicate", roll.Duplicate, true), selectedCount); Grid.SetRow(edits, 3); editor.Children.Add(edits);
+        noteEditControls.Add(fields);
+        noteEditControls.AddRange(edits.Children.OfType<Button>().Where(b => b.Content is not ("All" or "Copy")));
         var noteList = new Expander { Header = "Notes", Content = notes }; Grid.SetRow(noteList, 4); editor.Children.Add(noteList);
         stoppedControls.Add(mute); stoppedControls.Add(solo); stoppedControls.Add(fields); stoppedControls.Add(patternKind);
         AutomationProperties.SetName(notes, "Note list");
@@ -156,7 +177,7 @@ public sealed class MainWindow : Window
         stoppedControls.Add(record); stoppedControls.Add(arrangement);
         workspace = new(new()
         {
-            ["Outline"] = new ScrollViewer { Content = outline }, ["Patterns"] = editor,
+            ["Outline"] = outline, ["Patterns"] = editor,
             ["Perform"] = new ScrollViewer { Content = Column(activity, Label("Record into", record),
                 Button("Play section", PlaySection, true), Wrap(launchSection, launchBoundary, Button("Queue", QueueSection)),
                 arrangement, Label("Takes", takes), takeTools, new Expander { Header = "Bank", Content = BuildBankPane() }) }, ["Routing"] = routing
@@ -166,27 +187,22 @@ public sealed class MainWindow : Window
         AutomationProperties.SetName(launchSection, "Launch section"); AutomationProperties.SetName(launchBoundary, "Launch boundary");
         AutomationProperties.SetName(patternKind, "Pattern kind");
         files.Children.Add(Button("Reset layout", workspace.Reset));
-        var body = new Grid { RowDefinitions = new RowDefinitions("Auto,Auto,*,Auto") };
-        body.Children.Add(new ScrollViewer { Content = transport, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto });
-        Grid.SetRow(files, 1); body.Children.Add(files); Grid.SetRow(workspace, 2); body.Children.Add(workspace);
-        status.Margin = new Thickness(12, 6); Grid.SetRow(status, 3); body.Children.Add(status); Content = body;
+        var body = new Grid { RowDefinitions = new RowDefinitions("Auto,Auto,Auto,*,Auto") };
+        transport.Margin = new Thickness(12, 10, 4, 0); files.Margin = new Thickness(12, 0, 4, 0);
+        body.Children.Add(transport);
+        Grid.SetRow(files, 1); body.Children.Add(files);
+        var outputBar = Wrap(outputStatus, Button("Routing", () => workspace.Show("Routing")));
+        outputBar.Margin = new Thickness(12, 0, 4, 0); Grid.SetRow(outputBar, 2); body.Children.Add(outputBar);
+        Grid.SetRow(workspace, 3); body.Children.Add(workspace);
+        status.Margin = new Thickness(12, 6); status.TextWrapping = Avalonia.Media.TextWrapping.Wrap;
+        Grid.SetRow(status, 4); body.Children.Add(status); Content = body;
         AutomationProperties.SetName(status, "Status");
         Reload();
         if (File.Exists(layout)) Try(() => workspace.Restore(File.ReadAllText(layout)));
         Opened += (_, _) => { Try(workspace.OpenFloatingWindows); timer.Start(); };
         timer.Tick += (_, _) => TryTransport();
-        KeyDown += (_, e) =>
-        {
-            if (e.Handled || !e.KeyModifiers.HasFlag(KeyModifiers.Control) || e.Key != Key.Z || e.Source is TextBox or NumericUpDown) return;
-            Try(() => { if (e.KeyModifiers.HasFlag(KeyModifiers.Shift)) session.Redo(); else session.Undo(); ClearCandidate(); Reload(); }); e.Handled = true;
-        };
-        Closing += (_, _) =>
-        {
-            if (closing) return;
-            Try(session.Stop);
-            try { ProjectStore.WriteAtomic(layout, workspace.Save()); } catch (Exception ex) { status.Text = $"Layout not saved: {ex.Message}"; }
-            closing = true;
-        };
+        AddHandler(KeyDownEvent, HandleShortcuts, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        Closing += OnClosing;
         Closed += (_, _) => { timer.Stop(); workspace.Dispose(); session.Dispose(); };
     }
 
@@ -213,6 +229,24 @@ public sealed class MainWindow : Window
         AutomationProperties.SetName(control, text);
         return new StackPanel { Spacing = 3, Children = { new TextBlock { Text = text }, control } };
     }
+    private static Control AmountLabel(string text, Slider slider)
+    {
+        var value = new TextBlock { Text = $"{slider.Value:P0}", MinWidth = 40, VerticalAlignment = VerticalAlignment.Center };
+        slider.PropertyChanged += (_, e) => { if (e.Property == Slider.ValueProperty) value.Text = $"{slider.Value:P0}"; };
+        var row = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), ColumnSpacing = 8 };
+        row.Children.Add(slider); Grid.SetColumn(value, 1); row.Children.Add(value);
+        AutomationProperties.SetName(slider, text);
+        return Label(text, row);
+    }
+    private static Control PitchLabel(string text, NumericUpDown number)
+    {
+        static string Name(decimal? value) { var n = (int)(value ?? 60); return $"{new[] { "C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B" }[n % 12]}{n / 12 - 1}"; }
+        var label = new TextBlock { Text = $"{text} · {Name(number.Value)}" };
+        number.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) label.Text = $"{text} · {Name(number.Value)}"; };
+        AutomationProperties.SetName(number, text); Tip(number, "MIDI note number. Middle C is 60 (C4).");
+        return new StackPanel { Spacing = 3, Children = { label, number } };
+    }
+    private static long BeatsToTicks(decimal value) => (long)decimal.Round(value * MusicalTime.Ppq, 0, MidpointRounding.AwayFromZero);
     private Button Button(string title, Action action, bool stopped = false)
     {
         var button = new Button { Content = title }; button.Click += (_, _) => Try(action); if (stopped) stoppedControls.Add(button); return button;
@@ -222,7 +256,7 @@ public sealed class MainWindow : Window
         var button = new Button { Content = title }; button.Click += async (_, _) =>
         {
             button.IsEnabled = false;
-            try { await action(); status.Text = ""; } catch (Exception ex) { status.Text = ex.Message; }
+            try { await action(); } catch (Exception ex) { status.Text = ex.Message; }
             finally { button.IsEnabled = true; }
         }; if (stopped) stoppedControls.Add(button); return button;
     }
@@ -307,9 +341,11 @@ public sealed class MainWindow : Window
     {
         var progress = session.GenerationStatus; var running = session.Status().Running;
         var preparing = progress.Phase == GenerationPhase.Preparing;
+        candidateTools.IsVisible = candidate is not null || preparing || session.AuditionStatus.Phase != AuditionPhase.Idle;
+        candidateLabel.IsVisible = progress.Phase != GenerationPhase.Idle;
         candidateLabel.Text = progress.Phase switch
         {
-            GenerationPhase.Preparing => "Preparing…", GenerationPhase.Ready => "Candidate", GenerationPhase.Cancelled => "Cancelled",
+            GenerationPhase.Preparing => "Preparing…", GenerationPhase.Ready => "Preview ready · not yet saved", GenerationPhase.Cancelled => "Cancelled",
             GenerationPhase.Failed => progress.Error, _ => ""
         };
         cancelGeneration.IsVisible = preparing;
@@ -320,6 +356,7 @@ public sealed class MainWindow : Window
         audition.IsEnabled = candidate is not null && (!running || session.PlayingSectionId == candidate.Id && session.Armed is null);
         returnAudition.IsEnabled = running && session.AuditionStatus.Phase is AuditionPhase.Queued or AuditionPhase.Playing;
         roll.ReadOnly = candidate is not null || running;
+        foreach (var control in noteEditControls) control.IsEnabled = !running && candidate is null;
     }
     private void Reload()
     {
@@ -331,11 +368,16 @@ public sealed class MainWindow : Window
             sections.ItemsSource = choices; sections.SelectedItem = choices.First(c => c.Id == section.Id);
             var launch = (launchSection.SelectedItem as Choice)?.Id;
             launchSection.ItemsSource = choices; launchSection.SelectedItem = choices.FirstOrDefault(c => c.Id == launch) ?? choices[0];
-            sectionName.Text = o.Name; bars.Value = o.Bars; numerator.Value = o.Meter.Numerator; denominator.SelectedItem = o.Meter.Denominator;
-            root.Value = o.Root; scale.Text = string.Join(',', o.Scale); seed.Value = o.Seed;
-            density.Value = o.Density; intensity.Value = o.Intensity; variation.Value = o.Variation; tempo.Value = (decimal)project.Bpm;
-            var drums = section.Parts.FirstOrDefault(p => p.Role == PartRole.Drums)?.Pattern.Recipe;
-            if (drums?.Drummer is { } d) { drummer.SelectedIndex = (int)d.Persona + 1; ShowDrummer(d.Persona, d); } else if (drums is not null) drummer.SelectedIndex = 0;
+            if (!ReferenceEquals(loadedOutline, o))
+            {
+                sectionName.Text = o.Name; bars.Value = o.Bars; numerator.Value = o.Meter.Numerator; denominator.SelectedItem = o.Meter.Denominator;
+                root.Value = o.Root; scale.Text = string.Join(',', o.Scale); seed.Value = o.Seed;
+                density.Value = o.Density; intensity.Value = o.Intensity; variation.Value = o.Variation;
+                var drums = section.Parts.FirstOrDefault(p => p.Role == PartRole.Drums)?.Pattern.Recipe;
+                if (drums?.Drummer is { } d) { drummer.SelectedIndex = (int)d.Persona + 1; ShowDrummer(d.Persona, d); } else if (drums is not null) drummer.SelectedIndex = 0;
+                loadedOutline = o;
+            }
+            tempo.Value = (decimal)project.Bpm;
             var selected = (parts.SelectedItem as Choice)?.Id;
             var partChoices = DisplaySection.Parts.Select(p => new Choice(p.Id, p.Name)).ToArray(); parts.ItemsSource = partChoices;
             parts.SelectedItem = partChoices.FirstOrDefault(p => p.Id == selected) ?? partChoices[0];
@@ -345,9 +387,10 @@ public sealed class MainWindow : Window
             arrangement.Refresh(); RefreshTakes();
             RefreshBank();
             var destinations = string.Join('\n', WorkbenchSession.Destinations(project));
-            if (destinations != routedDestinations) { routedDestinations = destinations; routing.Rebuild(); }
+            if (destinations != routedDestinations) { routedDestinations = destinations; routing.Rebuild(preserveDraft: true); }
         }
         finally { loading = false; }
+        RefreshOutputStatus(); RefreshDocumentTitle();
         UpdateCandidate();
     }
     private Part? SelectedPart() => DisplaySection.Parts.FirstOrDefault(p => p.Id == (parts.SelectedItem as Choice)?.Id);
@@ -388,11 +431,11 @@ public sealed class MainWindow : Window
     private void SelectNote(MidiNote? n)
     {
         if (n is not null)
-        { pitch.Value = n.Pitch; velocity.Value = n.Velocity; tick.Value = n.Tick; duration.Value = n.Duration; locked.IsChecked = n.Locked; }
+        { pitch.Value = n.Pitch; velocity.Value = n.Velocity; tick.Value = 1m + (decimal)n.Tick / MusicalTime.Ppq; duration.Value = (decimal)n.Duration / MusicalTime.Ppq; locked.IsChecked = n.Locked; }
         syncingNotes = true;
         try { SyncNoteList(); } finally { syncingNotes = false; }
     }
-    private MidiNote Edited(string id) => new(id, (long)(tick.Value ?? 0), (long)(duration.Value ?? 240), (int)(pitch.Value ?? 60), (int)(velocity.Value ?? 90), locked.IsChecked == true);
+    private MidiNote Edited(string id) => new(id, BeatsToTicks((tick.Value ?? 1) - 1), BeatsToTicks(duration.Value ?? .25m), (int)(pitch.Value ?? 60), (int)(velocity.Value ?? 90), locked.IsChecked == true);
     private bool CommitNoteEdit(NoteEdit edit)
     {
         try
@@ -433,6 +476,7 @@ public sealed class MainWindow : Window
     private void RefreshTransport()
     {
         var s = session.Status();
+        RefreshDocumentTitle();
         if (s.Revision != revision) { candidate = null; Reload(); }
         var (section, position) = PlayingPosition(s);
         var playingTake = playback == "take" && s.PlayingSection is null;
@@ -445,23 +489,26 @@ public sealed class MainWindow : Window
         foreach (var c in stoppedControls) c.IsEnabled = !s.Running;
         sections.IsEnabled = !s.Running || session.Armed is null;
         play.Content = session.Armed is null ? "Play song" : "Record section";
-        Tip(play, session.Armed is null ? "Play the song order" : "Record the routing input into the selected section");
+        play.IsEnabled = !s.Running;
+        Tip(play, session.Armed is null ? "Play the song order (F5 play/stop; F8 stop)" : "Record the routing input into the selected section (F5 play/stop; F8 stop)");
         roll.ReadOnly = s.Running || candidate is not null;
         undo.IsEnabled = !s.Running && session.CanUndo; redo.IsEnabled = !s.Running && session.CanRedo;
         if (!ReferenceEquals(candidate, session.Candidate)) { candidate = session.Candidate; RefreshNotes(); }
         UpdateCandidate();
         var auditionProgress = session.AuditionStatus;
-        cancelQueued.IsEnabled = s.Running;
+        cancelQueued.IsEnabled = s.QueuedSection is not null;
         queuedStatus.Text = auditionProgress.Phase switch
         {
-            AuditionPhase.Queued => "Audition queued", AuditionPhase.Playing => "Audition", AuditionPhase.Returning => "Return queued", _ => ""
+            AuditionPhase.Queued => "Audition queued", AuditionPhase.Playing => "Audition", AuditionPhase.Returning => "Return queued",
+            _ => s.QueuedSection is { } queued ? $"Queued: {queued.Outline.Name}" : ""
         };
         patternKind.IsEnabled = !s.Running && candidate is null;
         mute.IsEnabled = solo.IsEnabled = candidate is null && (!s.Running || session.Armed is null && s.PlayingSection?.Id == session.SelectedSectionId);
         activity.Text = $"{s.CapturedEvents} events · {s.LateNotes} late" + (s.DroppedInputs > 0 ? $" · {s.DroppedInputs} inputs dropped" : "") + (s.SkippedClocks > 0 ? $" · {s.SkippedClocks} clocks skipped" : "");
         if (transportWasRunning && !s.Running) { Reload(); RefreshTakes(); }
         transportWasRunning = s.Running;
-        if (!s.CaptureComplete) status.Text = "Capture full. Save this take and start a new one."; else if (s.Error is not null) status.Text = s.Error;
+        if (s.Error is not null) status.Text = s.Error;
+        else if (!s.CaptureComplete) status.Text = "Take incomplete: capture limit or dropped MIDI input. Save this take before starting another.";
     }
     private void RefreshTakes(PerformanceTake? add = null)
     {
@@ -475,13 +522,14 @@ public sealed class MainWindow : Window
     private async Task Open()
     {
         var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Open project", AllowMultiple = false });
-        if (files.Count == 1 && files[0].TryGetLocalPath() is { } path) { session.Load(path); candidate = null; currentPart = null; Reload(); }
+        if (files.Count == 1 && files[0].TryGetLocalPath() is { } path && await ConfirmProjectReplacement())
+        { session.Load(path); savedProject = session.Project; projectPath = path; candidate = null; currentPart = null; Reload(); status.Text = $"Opened {Path.GetFileName(path)}"; }
     }
     private async Task Save()
     {
-        var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Save project", SuggestedFileName = "song.midiwork.json" });
-        if (file?.TryGetLocalPath() is { } path) session.Save(path);
+        await SaveProject(false);
     }
+    private async Task SaveAs() { await SaveProject(true); }
     private static readonly FilePickerFileType JsonType = new("Take (JSON)") { Patterns = ["*.json"] };
     private static readonly FilePickerFileType MidiType = new("Standard MIDI file") { Patterns = ["*.mid"] };
     private async Task LoadTake()
@@ -503,10 +551,10 @@ public sealed class MainWindow : Window
     {
         AutomationProperties.SetName(bankSongs, "Bank song"); AutomationProperties.SetName(bankOrder, "Bank order");
         Tip(bankSongs, "Select a saved bank song; Open loads it without starting playback");
-        var pane = Column(Label("Name", bankName), Wrap(Button("New", () => { session.NewBank(bankName.Text ?? "Bank"); RefreshBank(); }, true),
+        var pane = Column(Label("Name", bankName), Wrap(AsyncButton("New", async () => { if (await ConfirmBankReplacement()) { session.NewBank(bankName.Text ?? "Bank"); savedBank = null; RefreshBank(); } }, true),
             AsyncButton("Load bank", LoadBank, true), AsyncButton("Save bank", SaveBank, true)),
             Label("Song", bankSongs), Wrap(Button("Add current", () => { session.AddCurrentToBank(); RefreshBank(); }, true),
-                Button("Open", () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id) { session.OpenBankSong(id); candidate = null; currentPart = null; Reload(); } }, true),
+                AsyncButton("Open", async () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id && await ConfirmProjectReplacement()) { session.OpenBankSong(id); savedProject = session.Project; projectPath = null; candidate = null; currentPart = null; Reload(); } }, true),
                 Button("Update", () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id) { session.UpdateBankSong(id); RefreshBank(); } }, true)),
             Label("Set order", bankOrder), Wrap(Button("Append", () => { if (session.Bank is { } bank && (bankSongs.SelectedItem as Choice)?.Id is { } id) { session.SetBankOrder(bank.Order.Add(id)); RefreshBank(); } }, true),
                 Button("Remove", () => { if (session.Bank is { } bank && bankOrder.SelectedIndex >= 0) { session.SetBankOrder(bank.Order.RemoveAt(bankOrder.SelectedIndex)); RefreshBank(); } }, true),
@@ -535,11 +583,11 @@ public sealed class MainWindow : Window
     private async Task LoadBank()
     {
         var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Load bank", AllowMultiple = false, FileTypeFilter = [JsonType] });
-        if (files.Count == 1 && files[0].TryGetLocalPath() is { } path) { session.LoadBank(path); RefreshBank(); }
+        if (files.Count == 1 && files[0].TryGetLocalPath() is { } path && await ConfirmBankReplacement()) { session.LoadBank(path); savedBank = session.Bank; RefreshBank(); }
     }
     private async Task SaveBank()
     {
         var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Save bank", SuggestedFileName = "bank.json", FileTypeChoices = [JsonType] });
-        if (file?.TryGetLocalPath() is { } path) session.SaveBank(path);
+        if (file?.TryGetLocalPath() is { } path) { session.SaveBank(path); savedBank = session.Bank; status.Text = $"Saved {Path.GetFileName(path)}"; }
     }
 }

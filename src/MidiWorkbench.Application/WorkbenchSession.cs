@@ -11,6 +11,7 @@ public sealed record SessionStatus(bool Running, double Tick, int CapturedEvents
     long SkippedClocks, long DroppedInputs, string? Error, long Revision)
 {
     public Section? PlayingSection { get; init; }
+    public Section? QueuedSection { get; init; }
 }
 public enum GenerationPhase { Idle, Preparing, Ready, Cancelled, Failed }
 public enum AuditionPhase { Idle, Queued, Playing, Returning }
@@ -108,7 +109,7 @@ public sealed class WorkbenchSession : IDisposable
     public bool CanRedo { get { lock (gate) return redo.Count > 0; } }
     public IReadOnlyList<PerformanceTake> Takes { get { lock (gate) return takes.ToArray(); } }
     private int SectionIndex => Array.FindIndex(project.Sections.ToArray(), s => s.Id == selectedSectionId);
-    private void RequireStopped() { if (Running) throw new InvalidOperationException("Stop playback first."); }
+    private void RequireStopped() { HandleLostInput(); if (Running) throw new InvalidOperationException("Stop playback first."); }
     private void Apply(SongProject value)
     {
         value.Validate(); CancelDiscardedAudition(returnPlaying: true);
@@ -514,8 +515,14 @@ public sealed class WorkbenchSession : IDisposable
     }
     private void SnapshotCaptureSource()
     {
+        HandleLostInput();
+        if (rig.Input is not null && input is null)
+        {
+            try { OpenInput(); }
+            catch (MidiPortException ex) when (armed is null) { notice = ex.Message; }
+        }
         ResetAudition();
-        captureProjectId = project.Id; captureProjectName = project.Name; captureInput = rig.Input;
+        captureProjectId = project.Id; captureProjectName = project.Name; captureInput = input?.EndpointId;
         captureEndpointDestinations = rig.Routes.GroupBy(r => r.EndpointId, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First().Destination, StringComparer.Ordinal);
         captureDestination = armed == NewPhrase ? PhraseDestination : project.Sections[SectionIndex].Parts.FirstOrDefault(p => p.Id == armed)?.Destination;
         captureEndpoint = rig.Routes.FirstOrDefault(r => r.Destination == captureDestination)?.EndpointId;
@@ -524,6 +531,7 @@ public sealed class WorkbenchSession : IDisposable
     {
         lock (gate)
         {
+            HandleLostInput();
             if (Running) return;
             CommitRecording();
             ArchiveTake();
@@ -548,7 +556,7 @@ public sealed class WorkbenchSession : IDisposable
             var temporary = project with { Sections = [section], Arrangement = [] };
             var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), section);
             var ports = PlanPorts(plan, true);
-            captureMeter = section.Outline.Meter; SnapshotCaptureSource(); notice = null;
+            captureMeter = section.Outline.Meter; notice = null; SnapshotCaptureSource();
             Await(host.Start(plan, ports, project.Bpm, repeat));
         }
     }
@@ -609,6 +617,8 @@ public sealed class WorkbenchSession : IDisposable
             RequireStopped(); CommitRecording();
             if (target is null) { Await(host.Arm(null, 1)); armed = null; return; }
             if (rig.Input is null) throw new InvalidOperationException("Choose an input in Routing before recording.");
+            HandleLostInput();
+            if (input is null) OpenInput();
             var (destination, channel) = target == NewPhrase ? (PhraseDestination, 1)
                 : project.Sections[SectionIndex].Parts.FirstOrDefault(p => p.Id == target) is { } part ? (part.Destination, part.Channel)
                 : throw new ArgumentException("Unknown part.");
@@ -652,6 +662,7 @@ public sealed class WorkbenchSession : IDisposable
     {
         lock (gate)
         {
+            HandleLostInput();
             var s = host.Status;
             if (!s.Running && armed is not null && s.Take > committedTake)
             {
@@ -660,7 +671,8 @@ public sealed class WorkbenchSession : IDisposable
             }
             if (!s.Running && s.Take > archivedTake) ArchiveTake();
             return new(s.Running, s.Tick, s.Captured, s.CaptureComplete, s.LateNoteOns, s.SkippedClocks, s.DroppedInputs, notice ?? s.Error, revision)
-                { PlayingSection = PlayingSectionFor(s) };
+                { PlayingSection = PlayingSectionFor(s),
+                    QueuedSection = s.Running && s.QueuedPlanTag is { } tag && planSections.TryGetValue(tag, out var queued) ? queued : null };
         }
     }
 
@@ -669,20 +681,42 @@ public sealed class WorkbenchSession : IDisposable
         value.Validate();
         lock (gate)
         {
-            Await(host.Stop()); CommitRecording(); ArchiveTake(); Await(host.Arm(null, 1)); armed = null;
-            rig = value;
-            if (rigPath is not null) ProjectStore.SaveRig(rigPath, value);
+            HandleLostInput();
+            RequireStopped(); CommitRecording(); ArchiveTake();
+            // Prepare a changed input before touching the current rig or its input.
+            // Retain the existing handle for an unchanged endpoint: some drivers cannot open it twice.
+            var keepInput = value.Input is not null && value.Input == rig.Input && input is not null;
+            IMidiInputPort? nextInput = null;
+            try
+            {
+                if (!keepInput && value.Input is { } id) nextInput = backend.OpenInput(id, host.PostInput);
+                if (rigPath is not null) ProjectStore.SaveRig(rigPath, value);
+                Await(host.Arm(null, 1));
+                Await(host.WatchInput(keepInput ? input : nextInput));
+            }
+            catch { nextInput?.Dispose(); throw; }
+            armed = null; rig = value;
             var stale = outputs.Where(o => !value.Endpoints.Any(e => e.Id == o.Key)).ToArray();
             foreach (var (id, _) in stale) outputs.Remove(id);
             // Release messages from Stop can still be queued inside the lookahead.
             if (stale.Length > 0) _ = Task.Delay(250).ContinueWith(_ => { foreach (var (_, port) in stale) port.Dispose(); }, TaskScheduler.Default);
-            input?.Dispose(); input = null;
-            OpenInput();
+            if (!keepInput) { input?.Dispose(); input = nextInput; }
         }
     }
     private void OpenInput()
     {
-        if (rig.Input is { } id) input = backend.OpenInput(id, host.PostInput);
+        if (rig.Input is not { } id) return;
+        var opened = backend.OpenInput(id, host.PostInput);
+        try { Await(host.WatchInput(opened)); input = opened; }
+        catch { opened.Dispose(); throw; }
+    }
+    private void HandleLostInput()
+    {
+        if (input is not { Faulted: true } lost) return;
+        Await(host.InputDisconnected(lost.EndpointId));
+        CommitRecording(); ArchiveTake();
+        armed = null; ResetAudition();
+        lost.Dispose(); input = null;
     }
     private IMidiOutputPort Output(string endpointId)
     {
@@ -745,7 +779,12 @@ public sealed class WorkbenchSession : IDisposable
             bank = current with { Songs = current.Songs.SetItem(index, new(id, project)) };
         }
     }
-    public void Save(string path) => ProjectStore.Save(path, Project);
+    public void Save(string path)
+    {
+        SongProject snapshot;
+        lock (gate) { if (!Running) CommitRecording(); snapshot = project; }
+        ProjectStore.Save(path, snapshot);
+    }
     public void Load(string path)
     {
         var value = ProjectStore.Load(path);

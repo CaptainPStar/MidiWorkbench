@@ -23,7 +23,7 @@ Accepted notes are saved with their generator recipes. Opening a project does no
 - WinMM input/output and a dedicated transport worker; Memory and Loopback adapters for portable testing.
 - CLI operations for projects, generators, arranged-song simulation, MIDI export, banks and loopback measurements.
 
-Windows packages can be built from Linux, but Windows execution and physical MIDI timing still require testing on the target hardware. See [verification status](docs/status.md) for measured results and limits.
+The application builds and runs on Windows. Windows virtualMIDI delivery, shutdown and reopen checks pass on four ports; physical synth timing and unplug/reconnect acceptance remain separate. See [verification status](docs/status.md) for measured results and limits.
 
 ## Build and run
 
@@ -46,14 +46,27 @@ Or `bash scripts/publish.sh win-x64`. Output is under `artifacts/win-x64/`. Run 
 
 ## First session
 
-1. Routing: assign each destination an output. Choose the keyboard input and any clock-only outputs. Apply.
+1. The output bar identifies simulation, missing routes and MIDI outputs. Simulation sends no MIDI to instruments. Open Routing, assign each destination an output and channel, choose the input, enable Clock where wanted, then Apply routing.
 2. Outline: set meter, root, scale and musical amounts. Preview a section or a part generator. Audition, then Accept or Discard.
-3. Patterns: click empty space to add a note; drag it to move, or drag its right edge to resize. Right-click/Delete removes. Locked notes survive regeneration. Pattern kind explicitly controls Fixed/Hybrid/Generative behavior.
+3. Patterns: click empty space to add a note; drag it to move, or drag its right edge to resize. Right-click/Delete removes. Start beat is counted from 1; length is in quarter-note beats (0.25 = a sixteenth note), independent of meter. Pitch shows the note name and MIDI number. Locked notes survive regeneration. Pattern kind explicitly controls Fixed/Hybrid/Generative behavior.
 4. Perform: arm a part or New part, then play the section. Stop commits keyboard notes. Arm changes require stopped playback.
 5. Arrange sections with repeats or queue a section at a beat/bar boundary. Song banks hold reusable project snapshots and setlist order.
 6. Save the project, export the song as MIDI, or recall a captured take. A DAW or MusicSessionTrace can capture the performance; built-in recording remains available for phrase development.
 
 See [live generation and editing](docs/live-generation.md) for audition, variation, cancellation and keyboard controls.
+
+Save writes the accepted project. An unaccepted preview is separate and is not included until accepted. Closing or opening another project prompts for unsaved project/bank changes and unaccepted section changes. Save remembers the file path; Save as writes another file. Stopping and editing retain unapplied section settings until the accepted outline or selected section changes.
+
+| Shortcut | Action |
+|---|---|
+| F5 | Play/stop the song, or the armed section |
+| F8 | Stop |
+| Ctrl+Shift+Space | Panic: release notes and pedals immediately |
+| Ctrl+S / Ctrl+Shift+S | Save / Save as |
+| Ctrl+O | Open while stopped |
+| Ctrl+Z / Ctrl+Shift+Z | Undo / redo project edits |
+
+`scripts/verify.ps1` also renders the desktop offscreen and exercises its controls without sending OS input. Images and results are written to `artifacts/desktop-ux`. Tests isolate local settings using `MIDIWORKBENCH_SETTINGS_DIRECTORY`; ordinary launches use `%LOCALAPPDATA%\MidiWorkbench`.
 
 Arpeggiators can use captured notes as their source. Generator settings preserve that material in the recipe. Change only the part you intend to vary; Fixed material remains protected until explicitly converted.
 

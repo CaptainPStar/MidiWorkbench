@@ -17,6 +17,7 @@ public sealed class WorkbenchApp : Avalonia.Application
         Styles.Add(new FluentTheme());
         Styles.Add(new Dock.Avalonia.Themes.Fluent.DockFluentTheme());
         RequestedThemeVariant = Avalonia.Styling.ThemeVariant.Dark;
+        DesktopStyles.Apply(this);
     }
     public override void OnFrameworkInitializationCompleted()
     {

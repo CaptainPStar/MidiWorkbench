@@ -28,6 +28,11 @@ internal sealed class NoteEditor : Control
     private ImmutableArray<MidiNote> gesture = [], copied = [];
     private readonly HashSet<string> selection = new(StringComparer.Ordinal);
     private Dictionary<string, MidiNote> draft = new(StringComparer.Ordinal);
+    private Pattern? indexedPattern;
+    private MidiNote[] notesByTick = [];
+    private long[] prefixMaxEnd = [];
+    private Dictionary<int, int> pitchRows = [];
+    private Dictionary<string, int> paintOrder = new(StringComparer.Ordinal);
     private Point origin;
     private Rect? marquee;
     private string[] marqueeBase = [];
@@ -55,6 +60,9 @@ internal sealed class NoteEditor : Control
     public NoteEditor()
     {
         Focusable = true; ClipToBounds = true;
+        // Culling depends on the parent's viewport even when this fixed-size control has
+        // unchanged bounds. Resize and scroll must repaint stopped editors as well.
+        EffectiveViewportChanged += (_, _) => InvalidateVisual();
         AutomationProperties.SetName(this, "Note editor");
         ToolTip.SetTip(this, "Click to add; drag empty space to select a rectangle. Shift-click toggles notes. Drag selected notes to move; right edges resize. Click the ruler to place pasted notes. Ctrl+A selects all; Ctrl+C/V copies/pastes; Ctrl+D duplicates; Delete removes. Arrows move; Shift+Left/Right resizes; L locks; +/- changes velocity.");
     }
@@ -67,6 +75,8 @@ internal sealed class NoteEditor : Control
         lanes = drums ? new[] { 49, 51, 46, 42, 44, 39, 38, 40, 50, 48, 47, 45, 43, 41, 36, 35 }
             .Concat(value?.Pattern.Notes.Select(n => n.Pitch).Distinct().Except(new[] { 49, 51, 46, 42, 44, 39, 38, 40, 50, 48, 47, 45, 43, 41, 36, 35 }) ?? []).ToArray()
             : Enumerable.Range(0, 128).Reverse().ToArray();
+        if (!ReferenceEquals(indexedPattern, value?.Pattern)) RebuildNoteIndex(value?.Pattern);
+        pitchRows = lanes.Select((pitch, row) => (pitch, row)).ToDictionary(x => x.pitch, x => x.row);
         if (changed) { selection.Clear(); SelectedId = null; insertTick = 0; CancelGesture(); }
         var valid = value?.Pattern.Notes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal) ?? [];
         selection.RemoveWhere(id => !valid.Contains(id));
@@ -147,10 +157,36 @@ internal sealed class NoteEditor : Control
         Height = Header + lanes.Length * Lane; InvalidateVisual();
     }
     private static IBrush Brush(string color) => new SolidColorBrush(Color.Parse(color));
+    private void RebuildNoteIndex(Pattern? pattern)
+    {
+        indexedPattern = pattern;
+        notesByTick = pattern?.Notes.OrderBy(n => n.Tick).ToArray() ?? [];
+        paintOrder = pattern?.Notes.Select((note, index) => (note.Id, index)).ToDictionary(x => x.Id, x => x.index, StringComparer.Ordinal) ?? new(StringComparer.Ordinal);
+        prefixMaxEnd = new long[notesByTick.Length];
+        var maxEnd = long.MinValue;
+        for (var i = 0; i < notesByTick.Length; i++)
+        {
+            maxEnd = Math.Max(maxEnd, notesByTick[i].EndTick);
+            prefixMaxEnd[i] = maxEnd;
+        }
+    }
+    private int FirstVisibleNote(double leftTick)
+    {
+        // Find the first note whose end could reach the viewport. Prefix maxima keep
+        // this logarithmic even when long notes precede short notes in tick order.
+        var low = 0; var high = prefixMaxEnd.Length;
+        while (low < high)
+        {
+            var middle = low + (high - low) / 2;
+            if (prefixMaxEnd[middle] < leftTick) low = middle + 1; else high = middle;
+        }
+        return low;
+    }
     private void Text(DrawingContext context, string value, double x, double y, IBrush? brush = null) =>
         context.DrawText(new FormattedText(value, CultureInfo.InvariantCulture, FlowDirection.LeftToRight, font, 11, brush ?? Ink), new Point(x, y));
     internal Rect NoteRect(MidiNote n) => new(Labels + n.Tick * pixelsPerQuarter / MusicalTime.Ppq,
-        Header + Array.IndexOf(lanes, n.Pitch) * Lane + 2, Math.Max(5, n.Duration * pixelsPerQuarter / MusicalTime.Ppq), Lane - 4);
+        Header + (pitchRows.TryGetValue(n.Pitch, out var row) ? row : 0) * Lane + 2,
+        Math.Max(5, n.Duration * pixelsPerQuarter / MusicalTime.Ppq), Lane - 4);
     public override void Render(DrawingContext context)
     {
         base.Render(context); context.FillRectangle(BackgroundBrush, Bounds.WithX(0).WithY(0));
@@ -180,7 +216,15 @@ internal sealed class NoteEditor : Control
             var x = Labels + t * pixelsPerQuarter / MusicalTime.Ppq;
             context.DrawLine(t % outline.Meter.BarTicks == 0 ? BarPen : BeatPen, new Point(x, Header), new Point(x, Height));
         }
-        foreach (var stored in part.Pattern.Notes)
+        var visibleNotes = new Dictionary<string, MidiNote>(StringComparer.Ordinal);
+        var firstNote = FirstVisibleNote(Math.Max(0, (viewport.Left - Labels - 5) * MusicalTime.Ppq / pixelsPerQuarter));
+        var lastTick = (viewport.Right - Labels) * MusicalTime.Ppq / pixelsPerQuarter;
+        for (var i = firstNote; i < notesByTick.Length && notesByTick[i].Tick <= lastTick; i++)
+            visibleNotes[notesByTick[i].Id] = notesByTick[i];
+        // Drafts can be moved into the viewport from an offscreen starting position.
+        foreach (var (id, note) in draft) visibleNotes[id] = note;
+        // Preserve authored stacking order, matching the reverse-order pointer hit test.
+        foreach (var stored in visibleNotes.Values.OrderBy(n => paintOrder.GetValueOrDefault(n.Id, int.MaxValue)))
         {
             var n = draft.GetValueOrDefault(stored.Id, stored);
             var rect = NoteRect(n);

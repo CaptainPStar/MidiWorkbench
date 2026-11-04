@@ -44,11 +44,11 @@ public static class ProjectStore
     }
     public static void Save(string path, SongProject project)
     {
-        project.Validate(); WriteAtomic(path, JsonSerializer.Serialize(project, JsonOptions));
+        project.Validate(); WriteDocument(path, JsonSerializer.Serialize(project, JsonOptions));
     }
     public static void SaveTake(string path, PerformanceTake take)
     {
-        ValidateTake(take); WriteAtomic(path, JsonSerializer.Serialize(take, JsonOptions));
+        ValidateTake(take); WriteDocument(path, JsonSerializer.Serialize(take, JsonOptions));
     }
     public static PerformanceTake LoadTake(string path)
     {
@@ -67,7 +67,7 @@ public static class ProjectStore
     }
     public static void SaveBank(string path, SongBank bank)
     {
-        bank.Validate(); WriteAtomic(path, JsonSerializer.Serialize(bank, JsonOptions));
+        bank.Validate(); WriteDocument(path, JsonSerializer.Serialize(bank, JsonOptions));
     }
     public static SongBank LoadBank(string path)
     {
@@ -88,7 +88,13 @@ public static class ProjectStore
     }
     public static void SaveRig(string path, Rig rig)
     {
-        rig.Validate(); WriteAtomic(path, JsonSerializer.Serialize(rig, JsonOptions));
+        rig.Validate(); WriteDocument(path, JsonSerializer.Serialize(rig, JsonOptions));
+    }
+    private static void WriteDocument(string path, string json)
+    {
+        // Reject before replacing an existing file: every document we save must be readable.
+        if (System.Text.Encoding.UTF8.GetByteCount(json) > MaxBytes) throw new InvalidDataException("File exceeds 32 MiB.");
+        WriteAtomic(path, json);
     }
     private static string ReadLimited(string path)
     {

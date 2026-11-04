@@ -7,4 +7,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
     dotnet run --project tests/MidiWorkbench.Specs -c Release --no-build
     if ($LASTEXITCODE -ne 0) { throw 'Specifications failed.' }
+    dotnet run --project tests/MidiWorkbench.DesktopSpecs -c Release --no-build -- artifacts/desktop-ux
+    if ($LASTEXITCODE -ne 0) { throw 'Desktop workflow checks failed.' }
 } finally { Pop-Location }

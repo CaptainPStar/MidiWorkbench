@@ -18,6 +18,7 @@ public sealed class WinMmBackend : IMidiBackend
     private readonly Timer watcher;
     private string signature;
     private readonly ConcurrentDictionary<string, WeakReference<OutputPort>> openedOutputs = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, WeakReference<InputPort>> openedInputs = new(StringComparer.Ordinal);
     public event Action? EndpointsChanged;
     public WinMmBackend()
     {
@@ -31,6 +32,12 @@ public sealed class WinMmBackend : IMidiBackend
             {
                 if (!reference.TryGetTarget(out var port)) openedOutputs.TryRemove(id, out _);
                 else if (!connected.Contains(id)) port.MarkDisconnected();
+            }
+            var connectedInputs = endpoints.Where(e => e.Input).Select(e => e.Id).ToHashSet(StringComparer.Ordinal);
+            foreach (var (id, reference) in openedInputs)
+            {
+                if (!reference.TryGetTarget(out var port)) openedInputs.TryRemove(id, out _);
+                else if (!connectedInputs.Contains(id)) port.MarkDisconnected();
             }
             var next = string.Join("\n", endpoints.Select(e => e.Id));
             if (Interlocked.Exchange(ref signature, next) != next) EndpointsChanged?.Invoke();
@@ -66,8 +73,12 @@ public sealed class WinMmBackend : IMidiBackend
         openedOutputs[endpointId] = new(port);
         return port;
     }
-    public IMidiInputPort OpenInput(string endpointId, Action<TimedMidi> received) =>
-        new InputPort(endpointId, Index(endpointId, "winmm-in:", Native.InputNames()), received);
+    public IMidiInputPort OpenInput(string endpointId, Action<TimedMidi> received)
+    {
+        var port = new InputPort(endpointId, Index(endpointId, "winmm-in:", Native.InputNames()), received);
+        openedInputs[endpointId] = new(port);
+        return port;
+    }
     public void Dispose() => watcher.Dispose();
 
     private sealed class OutputPort : IMidiOutputPort
@@ -105,7 +116,10 @@ public sealed class WinMmBackend : IMidiBackend
         private IntPtr handle;
         private readonly Native.MidiInProc callback;
         private readonly Action<TimedMidi> received;
+        private volatile bool faulted;
         public string EndpointId { get; }
+        public bool Faulted => faulted;
+        public void MarkDisconnected() => faulted = true;
         public InputPort(string id, int index, Action<TimedMidi> received)
         {
             EndpointId = id; this.received = received;
@@ -117,14 +131,16 @@ public sealed class WinMmBackend : IMidiBackend
         // Driver thread: timestamp on arrival and enqueue only. Driver timestamps are not yet calibrated against the host clock.
         private void OnMessage(IntPtr h, uint message, IntPtr instance, IntPtr param1, IntPtr param2)
         {
-            if (message != Native.MimData) return;
+            if (faulted || message != Native.MimData) return;
             var data = (uint)param1.ToInt64();
             received(new(HostTime.Now, (byte)data, (byte)(data >> 8), (byte)(data >> 16)));
         }
         public void Dispose()
         {
-            if (handle == IntPtr.Zero) return;
-            _ = Native.midiInStop(handle); _ = Native.midiInReset(handle); _ = Native.midiInClose(handle); handle = IntPtr.Zero;
+            faulted = true;
+            var closing = Interlocked.Exchange(ref handle, IntPtr.Zero);
+            if (closing == IntPtr.Zero) return;
+            _ = Native.midiInStop(closing); _ = Native.midiInReset(closing); _ = Native.midiInClose(closing);
         }
     }
 }

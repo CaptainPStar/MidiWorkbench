@@ -22,6 +22,7 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
     private readonly Dictionary<(int Port, int Channel, int Pitch), (int Owners, int Destination)> held = new();
     private readonly HashSet<int> active = new();
     private readonly HashSet<(int Port, int Channel)> channels = new();
+    private readonly HashSet<(int Port, int Channel)> sustain = new();
     private readonly List<(int Port, int Destination, TimedMidi Message)> releases = new();
     private readonly TempoClock clock = new();
     public bool Running { get; private set; }
@@ -31,6 +32,7 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
     public double LastTempoChangeTime { get; private set; }
     public long SectionRevision { get; private set; }
     public string? ActivePlanTag => Running ? plan?.Tag : null;
+    public string? QueuedPlanTag => Running ? queuedPlan?.Tag : null;
     private static HashSet<int> RequiredPorts(ResolvedPlan value) =>
         value.Events.Select(e => e.Port).Concat(value.ClockPorts).ToHashSet();
     internal bool NeedsPort(int port) => Running && (activePorts.Contains(port) || queuedPorts.Contains(port));
@@ -52,7 +54,7 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
     {
         if (Running) Stop(now);
         plan = value; next = 0; cycleBase = 0; sectionBase = 0; queuedPlan = null; nextClock = 0; loop = repeat; LateNoteOns = 0; SkippedClocks = 0;
-        held.Clear(); active.Clear(); channels.Clear(); releases.Clear();
+        held.Clear(); active.Clear(); channels.Clear(); sustain.Clear(); releases.Clear();
         activePorts = RequiredPorts(value); queuedPorts.Clear();
         sections.Clear(); sections.Add((0, value.LengthTicks)); SectionRevision++;
         clock.Start(now, bpm); Running = true; emittedUntil = now;
@@ -107,6 +109,9 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
                 // Keep the launch cancellable until the actual boundary.
                 if (clock.SecondsAt(queuedTick) > now) break;
                 var transitionAt = Math.Max(clock.SecondsAt(queuedTick), now);
+                foreach (var (port, channel) in sustain)
+                    emit(port, -1, new(transitionAt + plan.OffsetSeconds[port], (byte)(0xB0 | channel), 64, 0));
+                sustain.Clear();
                 foreach (var (heldKey, h) in held)
                     emit(heldKey.Port, h.Destination, new(transitionAt + plan.OffsetSeconds[heldKey.Port], (byte)(0x80 | heldKey.Channel), (byte)heldKey.Pitch, 0));
                 held.Clear(); active.Clear();
@@ -151,7 +156,15 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
                 if (emitOwned is null) emit(m.Port, m.Destination, off);
                 if (at > now) releases.Add((m.Port, m.Destination, off));
             }
-            else emit(m.Port, m.Destination, new(at, m.Status, m.Data1, m.Data2));
+            else
+            {
+                if ((m.Status & 0xF0) == 0xB0 && m.Data1 == 64)
+                {
+                    var pedal = (m.Port, m.Status & 15);
+                    if (m.Data2 >= 64) sustain.Add(pedal); else sustain.Remove(pedal);
+                }
+                emit(m.Port, m.Destination, new(at, m.Status, m.Data1, m.Data2));
+            }
         }
         if (!loop && next >= events.Length && clock.TickAt(now) >= sectionBase + plan.LengthTicks && queuedPlan is null) Stop(now);
     }
@@ -160,18 +173,20 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
     {
         if (!Running || plan is null) return;
         var at = Math.Max(now, emittedUntil);
+        foreach (var (port, channel) in sustain) emit(port, -1, new(at + plan.OffsetSeconds[port], (byte)(0xB0 | channel), 64, 0));
         foreach (var (key, h) in held) emit(key.Port, h.Destination, new(at + plan.OffsetSeconds[key.Port], (byte)(0x80 | key.Channel), (byte)key.Pitch, 0));
         foreach (var port in plan.ClockPorts) emit(port, -1, new(at + plan.OffsetSeconds[port], 0xFC));
-        held.Clear(); active.Clear(); releases.Clear(); queuedPlan = null; queuedPorts.Clear(); Running = false;
+        held.Clear(); active.Clear(); sustain.Clear(); releases.Clear(); queuedPlan = null; queuedPorts.Clear(); Running = false;
     }
     // Callers cancel scheduled output first. Releases everything immediately, including releases that were cancelled.
     public void Panic(double now)
     {
         if (plan is null) return;
+        foreach (var (port, channel) in sustain) emit(port, -1, new(now, (byte)(0xB0 | channel), 64, 0));
         foreach (var (key, h) in held) emit(key.Port, h.Destination, new(now, (byte)(0x80 | key.Channel), (byte)key.Pitch, 0));
         foreach (var r in releases) emit(r.Port, r.Destination, r.Message with { Seconds = now });
         foreach (var (port, channel) in channels) emit(port, -1, new(now, (byte)(0xB0 | channel), 123, 0));
         if (Running) foreach (var port in plan.ClockPorts) emit(port, -1, new(now, 0xFC));
-        held.Clear(); active.Clear(); releases.Clear(); queuedPlan = null; queuedPorts.Clear(); Running = false;
+        held.Clear(); active.Clear(); sustain.Clear(); releases.Clear(); queuedPlan = null; queuedPorts.Clear(); Running = false;
     }
 }

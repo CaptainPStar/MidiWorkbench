@@ -17,13 +17,15 @@ internal sealed class GeneratorPane : StackPanel
     private readonly ComboBox direction = new() { ItemsSource = Enum.GetValues<ArpeggioDirection>(), SelectedItem = ArpeggioDirection.Up };
     private readonly CheckBox source = new() { Content = "Use part notes" };
     private readonly Button preview = new() { Content = "Preview part" };
+    private readonly Dictionary<Control, Control> fields = new();
     public Func<GeneratorSettings, Task>? Prepare { get; set; }
     public bool IsPreparing { set => preview.IsEnabled = !value; }
     public event Action<Exception>? Error;
     public GeneratorPane()
     {
         Spacing = 8;
-        Add("Generator", kind); Add("Seed", seed); Add("Steps", steps); Add("Step ticks", stepTicks);
+        Add("Generator", kind); Children.Add(preview);
+        Add("Seed", seed); Add("Steps", steps); Add("Step ticks", stepTicks);
         Add("Degrees", degrees); Add("Enabled steps", enabled);
         ToolTip.SetTip(degrees, "Scale degrees separated by commas; repeated over the sequence");
         ToolTip.SetTip(enabled, "Optional 1,0 sequence. Empty enables all steps.");
@@ -40,7 +42,6 @@ internal sealed class GeneratorPane : StackPanel
             try { if (Prepare is not null) await Prepare(Read()); } catch (Exception ex) { Error?.Invoke(ex); }
             finally { preview.IsEnabled = true; }
         };
-        Children.Add(preview);
         kind.SelectionChanged += (_, _) => UpdateFields(); UpdateFields();
         steps.PropertyChanged += (_, e) =>
         {
@@ -48,34 +49,43 @@ internal sealed class GeneratorPane : StackPanel
             pulses.Maximum = steps.Value ?? 16; rotation.Maximum = (steps.Value ?? 16) - 1;
         };
     }
-    public bool UseSource => source.IsChecked == true;
+    public bool UseSource => kind.SelectedItem is GeneratorKind.Arpeggiator && source.IsChecked == true;
     private static NumericUpDown N(decimal min, decimal max, decimal value) => new() { Minimum = min, Maximum = max, Value = value, MinWidth = 100 };
     private static Slider A(double value, double min, double max) => new() { Minimum = min, Maximum = max, Value = value, MinWidth = 130 };
     private void Add(string label, Control control)
     {
         AutomationProperties.SetName(control, label);
-        Children.Add(new TextBlock { Text = label }); Children.Add(control);
+        var field = new StackPanel { Spacing = 3, Children = { new TextBlock { Text = label }, control } };
+        fields[control] = field; Children.Add(field);
     }
     private void UpdateFields()
     {
         var k = (GeneratorKind)(kind.SelectedItem ?? GeneratorKind.StepSequencer);
-        pulses.IsEnabled = rotation.IsEnabled = k == GeneratorKind.Euclidean;
-        walk.IsEnabled = k == GeneratorKind.RandomWalk;
-        direction.IsEnabled = octaves.IsEnabled = source.IsEnabled = k == GeneratorKind.Arpeggiator;
-        chord.IsEnabled = progression.IsEnabled = k is GeneratorKind.Chord or GeneratorKind.Pad;
+        void Show(Control control, bool visible) => fields[control].IsVisible = visible;
+        Show(degrees, k is GeneratorKind.StepSequencer or GeneratorKind.Euclidean);
+        Show(pulses, k == GeneratorKind.Euclidean); Show(rotation, k == GeneratorKind.Euclidean);
+        Show(walk, k == GeneratorKind.RandomWalk);
+        Show(direction, k == GeneratorKind.Arpeggiator); Show(octaves, k == GeneratorKind.Arpeggiator);
+        source.IsVisible = k == GeneratorKind.Arpeggiator;
+        Show(chord, k is GeneratorKind.Arpeggiator or GeneratorKind.Chord or GeneratorKind.Pad);
+        Show(progression, k is GeneratorKind.Chord or GeneratorKind.Pad);
+        Show(stepTicks, k != GeneratorKind.Pad); Show(swing, k != GeneratorKind.Pad);
     }
     private static ImmutableArray<int> Parse(string? text) => (text ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToImmutableArray();
     private GeneratorSettings Read()
     {
+        var defaults = new GeneratorSettings();
         var settings = new GeneratorSettings((GeneratorKind)(kind.SelectedItem ?? GeneratorKind.StepSequencer))
         {
             Seed = (uint)(seed.Value ?? 1), Steps = (int)(steps.Value ?? 16), StepTicks = (long)(stepTicks.Value ?? 240),
-            StepDegrees = Parse(degrees.Text), EnabledSteps = Parse(enabled.Text).Select(v => v switch { 0 => false, 1 => true, _ => throw new ArgumentException("Enabled steps use 1 or 0.") }).ToImmutableArray(),
+            StepDegrees = fields[degrees].IsVisible ? Parse(degrees.Text) : defaults.StepDegrees,
+            EnabledSteps = Parse(enabled.Text).Select(v => v switch { 0 => false, 1 => true, _ => throw new ArgumentException("Enabled steps use 1 or 0.") }).ToImmutableArray(),
             Gate = gate.Value, Velocity = (int)(velocity.Value ?? 96), VelocitySpread = (int)(spread.Value ?? 8), Probability = probability.Value,
             Ratchet = (int)(ratchet.Value ?? 1), Swing = swing.Value, MinPitch = (int)(minPitch.Value ?? 36), MaxPitch = (int)(maxPitch.Value ?? 96),
             Pulses = (int)(pulses.Value ?? 5), Rotation = (int)(rotation.Value ?? 0), WalkStep = (int)(walk.Value ?? 2),
             Direction = (ArpeggioDirection)(direction.SelectedItem ?? ArpeggioDirection.Up), Octaves = (int)(octaves.Value ?? 1),
-            ChordDegrees = Parse(chord.Text), Progression = Parse(progression.Text), Grouping = Parse(groups.Text)
+            ChordDegrees = fields[chord].IsVisible ? Parse(chord.Text) : defaults.ChordDegrees,
+            Progression = fields[progression].IsVisible ? Parse(progression.Text) : defaults.Progression, Grouping = Parse(groups.Text)
         };
         settings.Validate(); return settings;
     }

@@ -1,0 +1,162 @@
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using MidiWorkbench.Domain;
+using MidiWorkbench.Persistence;
+
+namespace MidiWorkbench.Desktop;
+
+public sealed partial class MainWindow
+{
+    private SongProject? savedProject;
+    private SongBank? savedBank;
+    private string? projectPath;
+    private bool closePending, documentDialog;
+    private readonly TextBlock outputStatus = new() { VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap };
+    private bool ProjectChanged => !ReferenceEquals(savedProject, session.Project);
+    private bool BankChanged => session.Bank is not null && !ReferenceEquals(savedBank, session.Bank);
+
+    private void StartSong()
+    {
+        playback = session.Armed is null ? "song" : "section";
+        auditionSection = session.SelectedSection;
+        if (session.Armed is null) session.StartArrangement(loop.IsChecked == true);
+        else session.StartSection(session.SelectedSectionId, loop.IsChecked == true);
+    }
+
+    private void RefreshDocumentTitle() => Title = $"{(ProjectChanged ? "* " : "")}{(projectPath is null ? session.Project.Name : Path.GetFileName(projectPath))} — MidiWorkbench{(BankChanged ? " · Bank unsaved" : "")}";
+
+    private void RefreshOutputStatus()
+    {
+        var rig = session.Rig;
+        var available = session.Endpoints();
+        var destinations = session.Project.Sections.SelectMany(s => s.Parts).Select(p => p.Destination).Distinct().ToArray();
+        var routes = destinations.Select(d => rig.Routes.FirstOrDefault(r => r.Destination == d)).ToArray();
+        var missing = destinations.Where((_, i) => routes[i] is null).ToArray();
+        var offline = routes.Where(r => r is not null && !available.Any(e => e.Id == r.EndpointId && e.Output)).Select(r => r!.Destination).ToArray();
+        var real = routes.Where(r => r is not null && r.EndpointId is not ("memory" or "loopback")).Select(r => r!.EndpointId).Distinct().ToArray();
+        var simulated = routes.Count(r => r?.EndpointId is "memory" or "loopback");
+        var clocks = rig.Endpoints.Count(e => e.SendClock && e.Id is not ("memory" or "loopback"));
+        outputStatus.Text = missing.Length > 0 ? $"Not routed: {string.Join(", ", missing)}. Choose outputs in Routing."
+            : offline.Length > 0 ? $"Output offline: {string.Join(", ", offline)}. Check Routing."
+            : real.Length == 0 ? "Simulation — no MIDI sent to instruments. Choose outputs in Routing."
+            : $"MIDI: {string.Join(", ", real.Select(id => available.FirstOrDefault(e => e.Id == id)?.Name ?? id))} · Clock {(clocks == 0 ? "off" : $"enabled: {clocks} output(s)")}{(simulated > 0 ? $" · {simulated} simulated route(s)" : "")}";
+        outputStatus.Foreground = missing.Length > 0 || offline.Length > 0 ? Brushes.Orange : Brushes.LightGray;
+        Avalonia.Automation.AutomationProperties.SetName(outputStatus, "MIDI output status");
+    }
+
+    private async Task<bool> SaveProject(bool saveAs)
+    {
+        var path = projectPath;
+        if (saveAs || path is null)
+        {
+            var file = await StorageProvider.SaveFilePickerAsync(new()
+            {
+                Title = "Save project", SuggestedFileName = path is null ? "song.midiwork.json" : Path.GetFileName(path),
+                FileTypeChoices = [new("MidiWorkbench project") { Patterns = ["*.midiwork.json", "*.json"] }]
+            });
+            path = file?.TryGetLocalPath();
+            if (path is null) return false;
+        }
+        session.Save(path); savedProject = session.Project; projectPath = path;
+        RefreshDocumentTitle();
+        status.Text = $"Saved {Path.GetFileName(path)}" + (session.Armed is not null && session.Status().Running ? ". Recording continues; stop and save again to include this phrase."
+            : session.Candidate is not null ? ". Preview is not included; accept it to keep it." : "");
+        return true;
+    }
+
+    private async Task<bool> ConfirmProjectReplacement()
+    {
+        if (ProjectChanged)
+        {
+            var choice = await ConfirmSave("Unsaved project", "Save your project changes?", "Save", "Discard changes");
+            if (choice != 2 && !(choice == 1 && await SaveProject(false))) return false;
+        }
+        if (!HasUnacceptedChanges()) return true;
+        return await ConfirmSave("Unaccepted changes", "Discard the preview and unapplied section settings?", null, "Discard preview") == 2;
+    }
+
+    private bool HasUnacceptedChanges()
+    {
+        if (session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing) return true;
+        if (loadedOutline is null) return false;
+        try
+        {
+            var edited = ReadOutline();
+            return edited with { Scale = loadedOutline.Scale } != loadedOutline || !edited.Scale.SequenceEqual(loadedOutline.Scale);
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException or OverflowException) { return true; }
+    }
+
+    private async Task<bool> ConfirmBankReplacement()
+    {
+        if (!BankChanged) return true;
+        var choice = await ConfirmSave("Unsaved bank", "Save your bank and set order?", "Save bank", "Discard changes");
+        if (choice == 2) return true;
+        if (choice != 1) return false;
+        await SaveBank();
+        return !BankChanged;
+    }
+
+    private async Task<int> ConfirmSave(string title, string message, string? saveLabel, string discardLabel)
+    {
+        var dialog = new Window { Title = title, Width = 460, SizeToContent = SizeToContent.Height, CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false };
+        var cancel = new Button { Content = "Cancel", IsCancel = true };
+        var save = new Button { Content = saveLabel };
+        var discard = new Button { Content = discardLabel };
+        cancel.Click += (_, _) => dialog.Close(0); save.Click += (_, _) => dialog.Close(1); discard.Click += (_, _) => dialog.Close(2);
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right };
+        actions.Children.Add(discard); actions.Children.Add(cancel); if (saveLabel is not null) actions.Children.Add(save);
+        dialog.Content = new StackPanel { Margin = new Thickness(20), Spacing = 20,
+            Children = { new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap }, actions } };
+        dialog.Opened += (_, _) => cancel.Focus();
+        return await dialog.ShowDialog<int>(this);
+    }
+
+    private async void OnClosing(object? sender, WindowClosingEventArgs e)
+    {
+        if (closing) return;
+        e.Cancel = true;
+        if (closePending || documentDialog) return;
+        closePending = true;
+        try
+        {
+            session.Stop(); Reload();
+            if (!await ConfirmProjectReplacement() || !await ConfirmBankReplacement()) return;
+            try { ProjectStore.WriteAtomic(layout, workspace.Save()); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { System.Diagnostics.Trace.WriteLine($"Layout not saved: {ex.Message}"); }
+            closing = true; Close();
+        }
+        catch (Exception ex) { status.Text = ex.Message; }
+        finally { closePending = false; }
+    }
+
+    private async void HandleShortcuts(object? sender, KeyEventArgs e)
+    {
+        if (documentDialog || closePending || e.Handled) return;
+        var ctrl = e.KeyModifiers.HasFlag(KeyModifiers.Control);
+        var shift = e.KeyModifiers.HasFlag(KeyModifiers.Shift);
+        if (e.Key == Key.F8 || ctrl && shift && e.Key == Key.Space)
+        {
+            e.Handled = true; Try(() => { if (e.Key == Key.F8) session.Stop(); else session.Panic(); Reload(); RefreshTakes(); }); return;
+        }
+        if (e.Key == Key.F5 && e.KeyModifiers == KeyModifiers.None)
+        { e.Handled = true; Try(() => { if (session.Status().Running) session.Stop(); else StartSong(); Reload(); }); return; }
+        if (!ctrl) return;
+        if (e.Key == Key.S || e.Key == Key.O && !session.Status().Running)
+        {
+            e.Handled = true; documentDialog = true;
+            try { if (e.Key == Key.S) await SaveProject(shift); else await Open(); }
+            catch (Exception ex) { status.Text = ex.Message; }
+            finally { documentDialog = false; }
+            return;
+        }
+        if (e.Key == Key.Z && e.Source is not TextBox && e.Source is not NumericUpDown)
+        { e.Handled = true; Try(() => { if (shift) session.Redo(); else session.Undo(); ClearCandidate(); Reload(); }); }
+    }
+}

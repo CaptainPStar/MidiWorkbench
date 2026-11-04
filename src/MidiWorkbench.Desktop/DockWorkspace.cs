@@ -91,6 +91,12 @@ internal sealed class DockWorkspace : ContentControl, IDisposable
         using var stream = new MemoryStream(); serializer.Save(stream, host.Layout!);
         return System.Text.Encoding.UTF8.GetString(stream.ToArray());
     }
+    public void Show(string id)
+    {
+        if (host.Layout is not IRootDock root) return;
+        var document = Walk(root).OfType<Document>().FirstOrDefault(d => d.Id == id);
+        if (document?.Owner is IDock owner) { owner.ActiveDockable = document; factory.SetActiveDockable(document); }
+    }
     private void CloseFloating()
     {
         if (host.Layout is not IRootDock root) return;

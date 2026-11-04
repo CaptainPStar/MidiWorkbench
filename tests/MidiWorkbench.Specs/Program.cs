@@ -12,6 +12,8 @@ using MidiWorkbench.Specs;
 
 var tests = new (string Name, Action Run)[]
 {
+    ("backend safety suite", BackendSafetySpecs.Run),
+    ("persistence workflow regressions", PersistenceWorkflowRegressionSpecs.Run),
     ("transport regression suite", TransportRegressionSpecs.Run),
     ("composition and recording workflow suite", WorkflowSpecs.Run),
     ("configurable generator suite", GeneratorSpecs.Run),

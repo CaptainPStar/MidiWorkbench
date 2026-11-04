@@ -2,4 +2,6 @@
 <TargetFramework>net10.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
 <LangVersion>14.0</LangVersion><Deterministic>true</Deterministic><TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+<!-- Runtime publication must not rewrite the portable source lock files. -->
+<NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">$(MSBuildProjectDirectory)/obj/packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
 </PropertyGroup></Project>

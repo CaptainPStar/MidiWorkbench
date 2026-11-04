@@ -1,5 +1,18 @@
 # Verification status
 
+## 2026-11-04 Windows integration
+
+- Windows 10.0.19045, x64, .NET SDK 10.0.401: locked restore and Release build pass without warnings/errors. The complete engine/application specification executable passes 53/53 groups.
+- All 76 reproducible Avalonia offscreen pointer, keyboard, rendering and workflow assertions pass in normal verification. See [UI evidence](reports/windows-ui-2026-11-04.md) for coverage, minimum-size review and measured dense-note rendering.
+- Self-contained Windows x64 desktop and CLI publish successfully on this workstation.
+- The native desktop process launched on Windows and its accessibility tree was inspected. Native graphics capture timed out; the user stopped Windows UI automation with Escape. Further interactive testing used in-process headless Avalonia, not OS input. This does not establish human/manual desktop acceptance.
+- Corrected pedal/note cleanup, Panic during a pending Stop, queued input after Panic, input overflow/fault recovery, offline optional-input playback, natural-completion recording saves and oversized-document writes. Added independent regressions for these cases.
+- Independent design and UX reviews led to pinned preview actions, relevant generator fields, output/queue status, musical note fields, unsaved-change guards, readable routing at 1000×650, and routing draft preservation during endpoint refresh.
+- Approved native virtualMIDI probes on Drum, Pad1, Pad2 and Lead pass count, ownership, sustain cleanup, shutdown and reopen checks. Two 60-second runs each delivered 3,840 balanced note pairs and 2,880 clocks per port. See [runtime measurements](reports/windows-runtime-2026-11-04.md).
+- The load-window clock spacing error reached 26.783 ms and inter-port arrival skew reached 26.972 ms. These outliers remain measured limitations; no tight physical MIDI timing claim is made.
+
+The earlier Linux/cross-publish evidence below describes the PR #1 baseline. Windows execution is now tested as described above. Physical cable/synth, native unplug/reconnect, sleep/resume and hour-long acceptance still require the intended setup.
+
 ## 2026-11-04 live generation continuation
 
 - Release verification passes 51/51 specification groups, including live generation, transport replacement, batch note editing and independent workflow regressions.

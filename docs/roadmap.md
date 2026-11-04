@@ -10,7 +10,7 @@ The implementation includes project migrations, dedicated transport, WinMM adapt
 
 ## Hardware release gate
 
-Windows execution, real MIDI interfaces and external instruments must validate timing, sustained notes, Stop/Panic, disconnect/reconnect and long-session capture. Cross-publishing a Windows executable is not this acceptance test. Measure clock/notes under UI and CPU load before promising live-performance timing bounds.
+Windows execution and four-port virtualMIDI delivery/cleanup are now validated. The physical MIDI interfaces and external instruments still need timing, sustained-note, Stop/Panic, disconnect/reconnect and long-session acceptance. The observed virtual clock/skew outliers remain documented limits; no live-performance timing bound is promised. See [Windows runtime evidence](reports/windows-runtime-2026-11-04.md).
 
 ## Current priority: generation and orchestration
 
@@ -21,7 +21,7 @@ Background candidate preparation, explicit live audition/return/acceptance at mu
 - Deferred: streaming active takes with crash recovery; external performance capture takes priority over building a second recorder.
 - Count-in, retrospective capture and dedicated keyboard step entry.
 - Cross-loop note ties, take comping and nondestructive quantization.
-- Deletion tombstones, multi-note editing and richer conditional-note controls.
+- Deletion tombstones and richer conditional-note controls; multi-note editing is implemented and tested.
 - Direct editing during playback and candidate replacement across a full arrangement; current live acceptance is section-scoped.
 
 ## Broader composition and performance
