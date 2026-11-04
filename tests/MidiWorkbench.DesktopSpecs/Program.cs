@@ -44,7 +44,23 @@ internal static class Program
                 CheckProgrammaticNoteVisibility(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
                 SetField("closing", true); window.Close(); Pump(); return 0;
             }
+            if (args.Contains("--draft-only"))
+            {
+                CheckDiscardedDrafts(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            if (args.Contains("--density-only"))
+            {
+                CheckGeneratorDensityContext(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
             CheckProgrammaticNoteVisibility();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckDiscardedDrafts();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckGeneratorDensityContext();
             SetField("closing", true); window.Close(); Pump();
             window = new MainWindow(); window.Show(); Pump();
             CheckPadRegisterWorkflow();
@@ -237,6 +253,81 @@ internal static class Program
         Click("Apply");
         var edited = session.SelectedSection.Parts[0].Pattern.Notes.Single(n => n.Id == "beat-precision-319");
         Check(edited.Tick == 240 && edited.Duration == 240, "Quarter-beat field edits commit 240 ticks");
+    }
+    private static void CheckDiscardedDrafts()
+    {
+        var session = Field<WorkbenchSession>("session"); var originalOutline = session.SelectedSection.Outline;
+        var complexity = Field<Slider>("complexity"); var initialComplexity = complexity.Value;
+        var generator = Field<Control>("generators"); var generatorType = generator.GetType();
+        var generatorSeed = (NumericUpDown)generatorType.GetField("seed", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        var originalSeed = generatorSeed.Value;
+        var workspace = Field<Control>("workspace"); workspace.GetType().GetMethod("Show")!.Invoke(workspace, ["Perform"]); Pump();
+        var arrangement = Field<Control>("arrangement"); var arrangementType = arrangement.GetType();
+        var repeats = (NumericUpDown)arrangementType.GetField("repeats", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(arrangement)!;
+        var set = arrangement.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Set"));
+        void SetRepeats() { set.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump(); }
+        Window Warning() => window.OwnedWindows.Single(w => w.Title == "Unaccepted changes");
+        bool HasDraft() => (bool)typeof(MainWindow).GetMethod("HasUnacceptedChanges", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, null)!;
+        Field<TextBox>("sectionName").Text = "Unapplied name"; complexity.Value = .91; generatorSeed.Value = (originalSeed ?? 0) + 7;
+        repeats.Value = 2; SetRepeats(); Click(Warning(), "Cancel"); Pump();
+        Check(session.Project.Arrangement.IsEmpty && Field<TextBox>("sectionName").Text == "Unapplied name"
+            && complexity.Value == .91 && generatorSeed.Value == (originalSeed ?? 0) + 7,
+            "Cancel arrangement change preserves accepted order and all drafts");
+        SetRepeats(); Click(Warning(), "Discard changes"); Pump();
+        Check(session.Project.Arrangement.Length == 1 && session.Project.Arrangement[0].Repeats == 2, "Discard permits the requested arrangement change");
+        Check(Field<TextBox>("sectionName").Text == originalOutline.Name && complexity.Value == initialComplexity && generatorSeed.Value == originalSeed && !HasDraft(),
+            "Discard restores outline, drummer and generator drafts to accepted values");
+        repeats.Value = 3; SetRepeats();
+        Check(!window.OwnedWindows.Any(w => w.Title == "Unaccepted changes") && session.Project.Arrangement[0].Repeats == 3,
+            "A second arrangement change does not repeat the discarded-draft prompt");
+
+        Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null); var candidate = session.Candidate;
+        Field<TextBox>("sectionName").Text = "Keep this outline draft"; complexity.Value = .87;
+        generatorSeed.Value = (generatorSeed.Value ?? 0) + 1;
+        var parts = Field<ComboBox>("parts"); var prior = parts.SelectedIndex; parts.SelectedIndex = prior == 0 ? 1 : 0; Pump();
+        Check(Warning().GetVisualDescendants().OfType<TextBlock>().Any(t => t.Text == "Discard unapplied generator settings?"),
+            "Part-change warning identifies its generator-only discard scope");
+        Click(Warning(), "Discard changes"); Pump();
+        Check(parts.SelectedIndex != prior && ReferenceEquals(session.Candidate, candidate)
+            && Field<TextBox>("sectionName").Text == "Keep this outline draft" && complexity.Value == .87,
+            "Discarding a part-generator draft keeps the preview and unrelated outline and drummer drafts");
+        repeats.Value = 4; SetRepeats(); Click(Warning(), "Cancel"); Pump();
+        Check(ReferenceEquals(session.Candidate, candidate) && Field<TextBox>("sectionName").Text == "Keep this outline draft"
+            && session.Project.Arrangement[0].Repeats == 3, "Cancel preserves preview, unrelated drafts and accepted arrangement");
+        SetRepeats(); Click(Warning(), "Discard changes"); Pump();
+        Check(session.Candidate is null && Field<TextBox>("sectionName").Text == originalOutline.Name && !HasDraft()
+            && session.Project.Arrangement[0].Repeats == 4, "General discard clears preview and drafts after the requested action");
+        var scale = Field<TextBox>("scale"); var originalScale = scale.Text; scale.Text = "invalid scale";
+        repeats.Value = 5; SetRepeats(); Click(Warning(), "Cancel"); Pump();
+        Check(scale.Text == "invalid scale" && session.Project.Arrangement[0].Repeats == 4, "Cancel preserves invalid outline input for correction");
+        SetRepeats(); Click(Warning(), "Discard changes"); Pump();
+        Check(scale.Text == originalScale && !HasDraft() && session.Project.Arrangement[0].Repeats == 5,
+            "Discard restores invalid outline input without another prompt");
+    }
+    private static void CheckGeneratorDensityContext()
+    {
+        var session = Field<WorkbenchSession>("session"); var generator = Field<Control>("generators"); var type = generator.GetType();
+        var context = (TextBlock)type.GetField("densityContext", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        var kind = (ComboBox)type.GetField("kind", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        var probability = (Slider)type.GetField("probability", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        kind.SelectedItem = GeneratorKind.Euclidean; probability.Value = 1; Pump();
+        Check(context.Text!.Contains("35") && context.Text.Contains("step chance"), "Generator shows the accepted 35% section density as a step-chance factor");
+        var tip = ToolTip.GetTip(context)?.ToString() ?? "";
+        Check(tip.Contains("accepted section density") && tip.Contains("Preview section") && tip.Contains("per-step probabilities"),
+            "Density help explains accepted outline edits and other probability factors");
+        var section = window.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Section settings"));
+        var panel = window.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Part generator"));
+        section.IsExpanded = false; panel.IsExpanded = true; Pump();
+        generator.GetVisualAncestors().OfType<ScrollViewer>().First().Offset = new Vector(0, 230); Pump();
+        Capture("generator-density-35-1000x650", 1000, 650);
+        Field<Slider>("density").Value = 1; Pump();
+        Check(context.Text!.Contains("35"), "Unapplied section density draft does not change the generator context");
+        Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null && Field<Button>("accept").IsEnabled);
+        Check(context.Text!.Contains("35"), "An unaccepted 100% section preview still shows accepted density 35%");
+        Field<Button>("accept").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(context.Text!.Contains("100"), "Accepting the outline updates generator context to 100%");
     }
     private static void CheckProgrammaticNoteVisibility()
     {

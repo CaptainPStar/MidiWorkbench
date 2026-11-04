@@ -438,6 +438,7 @@ public sealed partial class MainWindow : Window
             mute.IsChecked = p?.Muted == true; solo.IsChecked = p?.Solo == true; patternKind.SelectedItem = p?.Pattern.Kind;
             var settings = p?.Pattern.Recipe?.Settings;
             if (changed || !ReferenceEquals(loadedGeneratorSettings, settings)) { generators.Load(settings, DisplaySection.Outline.Seed); loadedGeneratorSettings = settings; }
+            generators.SetSectionDensity(session.SelectedSection.Outline.Density);
             currentPart = p?.Id;
             if (changed || center) Dispatcher.UIThread.Post(() => rollScroll.Offset = new Vector(rollScroll.Offset.X, roll.SuggestedOffset), DispatcherPriority.Loaded);
         }

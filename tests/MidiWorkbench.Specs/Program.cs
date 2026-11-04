@@ -12,6 +12,7 @@ using MidiWorkbench.Specs;
 
 var tests = new (string Name, Action Run)[]
 {
+    ("MIDI export preserves declared and recorded extent", MidiExtentSpecs.Run),
     ("harmonic placement and recipe versions", GenerationMusicalSpecs.Run),
     ("song and bank identity", SongIdentitySpecs.Run),
     ("bounded take history and archive recovery", TakeHistorySpecs.Run),

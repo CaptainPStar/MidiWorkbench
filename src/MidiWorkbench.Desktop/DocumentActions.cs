@@ -151,11 +151,42 @@ public sealed partial class MainWindow
         try
         {
             var changed = generatorOnly ? generators.HasDraft : HasUnacceptedChanges();
-            if (changed && await ConfirmSave("Unaccepted changes", "Discard the preview and unapplied settings?", null, "Discard changes") != 2) return;
+            var message = generatorOnly ? "Discard unapplied generator settings?" : "Discard the preview and unapplied settings?";
+            if (changed && await ConfirmSave("Unaccepted changes", message, null, "Discard changes") != 2) return;
             action();
+            if (changed) RestoreDiscardedDrafts(generatorOnly);
         }
         catch (Exception ex) { status.Text = ex.Message; }
         finally { documentDialog = false; }
+    }
+
+    private void RestoreDiscardedDrafts(bool generatorOnly)
+    {
+        if (generatorOnly)
+        {
+            var settings = SelectedPart()?.Pattern.Recipe?.Settings;
+            generators.Load(settings, DisplaySection.Outline.Seed);
+            loadedGeneratorSettings = settings;
+            return;
+        }
+        if (candidate is not null || session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing) ClearCandidate();
+        if (loadedDrummer is { } baseline)
+        {
+            var wasLoading = loading; loading = true;
+            try
+            {
+                drummer.SelectedIndex = baseline.Persona; complexity.Value = baseline.Complexity; fills.Value = baseline.Fills;
+                swing.Value = baseline.Swing; halfTime.IsChecked = baseline.HalfTime;
+            }
+            finally { loading = wasLoading; }
+        }
+        // Reload must repopulate even when an arrangement edit retains the same
+        // immutable outline and recipe instances as before the edit.
+        loadedOutline = null;
+        Reload();
+        var acceptedSettings = SelectedPart()?.Pattern.Recipe?.Settings;
+        generators.Load(acceptedSettings, DisplaySection.Outline.Seed);
+        loadedGeneratorSettings = acceptedSettings;
     }
 
     private async Task<bool> ConfirmBankReplacement()

@@ -860,7 +860,7 @@ public sealed class WorkbenchSession : IDisposable
         }
         var tracks = plan.Events.GroupBy(e => e.Destination).Select(g => new SmfTrack(g.Key,
             g.Select(e => new SmfEvent(e.Tick, e.Status, e.Data1, e.Data2)).ToArray())).ToArray();
-        ProjectStore.WriteAtomic(path, MidiFile.Build(meters, [(0, snapshot.Bpm)], tracks));
+        ProjectStore.WriteAtomic(path, MidiFile.Build(meters, [(0, snapshot.Bpm)], tracks, plan.LengthTicks));
     }
     public PerformanceTake Take()
     {

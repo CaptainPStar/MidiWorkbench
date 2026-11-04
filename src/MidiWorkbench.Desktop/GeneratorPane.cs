@@ -30,6 +30,7 @@ internal sealed class GeneratorPane : StackPanel
     private readonly ComboBox direction = new() { ItemsSource = Enum.GetValues<ArpeggioDirection>(), SelectedItem = ArpeggioDirection.Up };
     private readonly CheckBox source = new() { Content = "Use part notes" };
     private readonly Button preview = new() { Content = "Preview part" };
+    private readonly TextBlock densityContext = new() { MaxWidth = 260, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly Dictionary<Control, Control> fields = new();
     private string? loadedDraft;
     private GeneratorSettings loadedSettings = new();
@@ -41,7 +42,9 @@ internal sealed class GeneratorPane : StackPanel
     public GeneratorPane()
     {
         Spacing = 8;
-        Add("Generator", kind); Children.Add(preview);
+        Add("Generator", kind); Children.Add(preview); Children.Add(densityContext);
+        ToolTip.SetTip(densityContext, "Uses the accepted section density. Preview section and Accept apply outline edits. Step masks, local probability and per-step probabilities also affect results.");
+        AutomationProperties.SetName(densityContext, "Accepted section density");
         Add("Seed", seed); Add("Steps", steps); Add("Step length", stepLength); Add("Quarter-note beats", stepBeats);
         ToolTip.SetTip(stepLength, "Note value per step. Custom uses quarter-note beats.");
         ToolTip.SetTip(stepBeats, "1 beat = quarter note; 0.5 = eighth note. Rounded to the nearest MIDI tick.");
@@ -76,6 +79,7 @@ internal sealed class GeneratorPane : StackPanel
         };
     }
     public bool UseSource => kind.SelectedItem is GeneratorKind.Arpeggiator && source.IsChecked == true;
+    public void SetSectionDensity(double density) => densityContext.Text = $"Section density: {density:P0} · affects step chance";
     private long ReadStepTicks() => stepLength.SelectedItem is StepLengthOption { Ticks: { } ticks } ? ticks
         : (long)decimal.Round((stepBeats.Value ?? .25m) * MusicalTime.Ppq, 0, MidpointRounding.AwayFromZero);
     private string Draft() => System.Text.Json.JsonSerializer.Serialize(new object?[] { kind.SelectedItem, seed.Value, steps.Value, ReadStepTicks(),
