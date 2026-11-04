@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup></PropertyGroup><ItemGroup><ProjectReference Include="../MidiWorkbench.Engine/MidiWorkbench.Engine.csproj" /></ItemGroup></Project>

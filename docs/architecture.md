@@ -1,75 +1,53 @@
 # Architecture
 
-Use a modular .NET 10 application with a UI-independent musical model, deterministic planners, compiled playback plans, a dedicated transport owner, and replaceable MIDI adapters. Avalonia is the initial desktop frontend. Hardware MIDI integration is Windows-first; domain and planning code remain portable.
+The application separates musical material, prepared plans, machine routing, transport and presentation. Domain, generation, persistence and engine have no Avalonia dependency. Only MIDI is produced; instruments remain external.
 
-## Current project boundaries
-
-| Project | Responsibility | References |
-|---|---|---|
-| Domain | Musical ticks, meter, outlines, projects, notes, routes, captures | BCL only |
-| Generation | Deterministic section preparation and lock preservation | Domain |
-| Engine | Tempo mapping, plan compilation, event ordering, transport, sink contract | Domain |
-| Persistence | Validated JSON load/save and atomic replacement | Domain |
-| Application | Use cases and session lifetime; worker ownership | Domain, Generation, Engine, Persistence |
-| Desktop | Avalonia shell, Dock, outline/note controls, file pickers | Application and its public model dependencies |
-| Cli | New, validate, deterministic simulation | Application |
-| Specs | Executable behavior specifications without test-framework packages | Application |
-
-```mermaid
-flowchart TD
-  UI["Desktop / CLI"] --> App["Application services"]
-  App --> Planner["Generation"]
-  App --> Store["Persistence"]
-  App --> Engine["Transport engine"]
-  Planner --> Model["Musical model"]
-  Store --> Model
-  Engine --> Model
-  Engine --> Sink["MIDI adapter"]
-```
-
-The current IMidiSink implementation stores events in memory. Hardware discovery, timestamped submission and input capture are intentionally not faked.
+| Project | Responsibility |
+|---|---|
+| Domain | Versioned projects, outlines, patterns, generator settings, banks, rigs and takes |
+| Generation | Seeded section/part candidates, drummer, sequencer, arpeggio and stochastic algorithms |
+| Engine | Musical/host time, compiled plans, route resolution, scheduling, input, ownership and capture |
+| Persistence | Validated JSON migration, atomic files and SMF export |
+| Application | Project history, sections, arrangement compilation, candidates, recording, banks and take recall |
+| Midi.Windows | WinMM ports, polling for endpoint changes and high-resolution wait |
+| Desktop | Docking, piano roll/drum grid, generation, performance and routing controls |
+| Cli | Headless project/generation/bank workflows and MIDI diagnostics |
+| Specs | Executable deterministic regressions and session lifecycle tests |
 
 ## Thread ownership
 
-Target: commands enter a bounded transport queue. One transport worker owns playback position, prepared-plan activation, note ownership and endpoint dispatch. Immutable status snapshots flow back to the UI. Planner jobs operate on versioned snapshots and return candidates. Persistence runs off the timing path. Native input callbacks only timestamp and enqueue.
+`WorkbenchSession` owns project state and port lifetimes. Immutable project snapshots and compiled plans cross the engine boundary. Generation, file access and phrase conversion occur outside the scheduler. Accepted edits have undo/redo history; candidates remain separate until accepted. Candidate preparation uses immutable snapshots, request identities and a per-session computation gate. Supersession, cancellation, selection changes and project reload invalidate stale results. Computation may finish after cancellation, but cannot publish or overlap the next computation.
 
-Scaffold: WorkbenchSession serializes operations with a short lock and pumps a memory-only Transport on a dedicated task. A 2 ms wait is a demonstration driver, not a production scheduler. Generation is outside the lock and rejects concurrent replacement. Note editing and generation require stopped transport. This deliberate restriction precedes bounded command queues and boundary commits; do not market it as live orchestration yet.
+`TransportHost` owns one worker and `Transport`. Ordinary commands use a bounded channel; Stop/Panic/Exit use a separate urgent path. Input callbacks timestamp and enqueue only. Each scheduler iteration limits input work so feedback or heavy input cannot starve transport commands. Status is published as immutable snapshots; the UI refresh does not drive timing.
 
-The UI's 50 ms refresh never advances transport. TempoClock derives positions from monotonic host time instead of counting UI ticks. Playback is one-shot for the selected first section in this foundation.
+Immediate ports receive queued messages at their deadlines. Scheduled ports accept future timestamps and must implement cancellation. WinMM is immediate. The worker's high-resolution wait reduces wake granularity; timestamps do not certify physical output timing. Shared process/runtime pauses and driver behavior still require measurement.
 
-## Preparation and performance
+## Timing and ownership
 
-1. Capture an outline/project revision and generator version.
-2. Prepare candidate motifs, roles, fills and coordinated transitions away from the scheduler.
-3. Validate bounds, pitch/range, ownership, routing and protected material.
-4. Publish a candidate for audition, not directly into the accepted arrangement.
-5. On commit, compile an immutable plan and activate it at a selected beat/bar/phrase boundary.
-6. Preserve actual output and user actions independently of recipes.
+Musical time is 960 PPQ. MIDI Clock is 24 pulses per quarter note. Tempo changes preserve musical position. A plan keeps note events separate from clock generation. External clock following is a future mode; internal master owns timing in this version.
 
-Only steps 1–3 and stopped replacement are implemented. Candidate comparison and boundary activation are milestones. A late planner job must leave the current plan playing. Never recompute performed history as a side effect of changing a future section.
+Route resolution deduplicates physical ports and includes clock-only endpoints. A project-wide destination set provides stable metadata for queued section changes. Stable port slots open only the active plan’s required outputs and clock endpoints; additional outputs are prepared before a queued transition is accepted, outside the scheduler. Port/channel/pitch ownership combines generated and thru sources. A skipped attack cannot release another source's note. Pedal state is explicitly released during emergency cleanup.
 
-## Events and timing
+Stop preserves the defined queued-output tail and completes after immediate pending releases. Panic cancels future scheduled output, clears pending output and releases notes/pedals. Stale pending attacks and clock pulses are counted and skipped instead of burst-transmitted after a stall. Output faults stop playback and attempt release on other outputs.
 
-Domain time uses signed 64-bit ticks at 960 PPQ; UI uses one-based MIDI channels and note numbers. Adapter boundaries convert channels to zero-based wire values. This resolution supports ordinary straight/triplet patterns; arbitrary tuplets may require rational positions in a later schema.
+Queued plans activate at a musical boundary after the existing lookahead. Selection and launch are independent. Scene changes preserve clock continuity and release the outgoing section's owned notes. Live auditions use separate plan identities and do not commit the project; returning restores accepted material. Accepting commits an undoable project edit and queues the prepared plan. Cancelling that launch does not undo the committed edit. Each queued section version has a distinct plan identity mapped to an immutable section snapshot. Active-plan identity changes at the actual boundary, so accepting an edit cannot prematurely change the displayed meter or length.
 
-Events at the same musical time release a repeated pitch before its next attack. The prototype groups simultaneous same-pitch owners into one held note and only releases the final owner. Production must expose retrigger/merge policies; MIDI 1.0 cannot identify voices sharing a channel and pitch. Skipped late note-ons never acquire ownership.
+## Capture and recall
 
-The prototype skips note-ons more than 25 ms late and limits clock catch-up. These are provisional simulation choices. Hardware operation must use measured, configurable late-event/lost-clock policies and report faults; silently skipping synchronization pulses is not a complete production policy.
+Capture records input, submitted output and actions separately. Thru retains its routed channel and logical destination. Cancelled future submissions are reconciled out of saved output. Input loss and capture/journal overflow mark a take incomplete.
 
-## Persistence and recall
+Recording is armed while stopped and committed as locked notes after Stop. The target is stable during recording. Loop passes overdub into the section; cross-boundary note tails are currently shortened. Raw input retains controllers, while phrase conversion represents sustain as note duration. This distinction is visible in the saved take versus the editable phrase.
 
-SongProject contains musical material and logical destination names. Rig resolves destinations to hardware endpoints. Workspace contains docking only and lives under LocalApplicationData/MidiWorkbench/layout.json. A song never stores a live endpoint object or transport thread.
+Completed takes can be archived atomically by the application and recovered on startup. Active capture still uses bounded in-memory storage; it is not a crash-recoverable streaming recorder. An incomplete take is explicitly marked. An output timestamp is a submission/deadline, not proof of sound onset.
 
-ProjectStore validates version and musical bounds, writes a temporary sibling and replaces the target. This prevents publishing partially serialized JSON; it is not a power-failure durability guarantee. Add migrations, backups, checksums and crash recovery before extensive capture workflows.
+Replay uses captured output timing rather than regenerating recipes. Recorded clock messages are replayed without an additional generated clock stream. Current-rig destinations or explicit endpoint mappings determine playback routing. SMF export retains tempo and arrangement meter changes.
 
-Capture is bounded and flags overflow. JSON records actual submitted event times, not physical sound onset. Musical recipes and MIDI captures need generator version, seed and performance journal for repeatability; these metadata extensions are specified in project-model.md.
+## Device boundary
 
-## MusicSessionTrace integration
+WinMM exposes immediate short-message I/O. Input timestamps are host arrival; driver timestamps are not calibrated. Endpoint IDs are name plus occurrence. The watcher marks removed opened outputs faulted; reconnecting reopens them on Play. Real enumeration, disconnect/reconnect, sustain, dense traffic and long-session timing remain hardware acceptance tests.
 
-Inspected on 2026-11-04: SessionBeatTimeline, SessionClock, BeatPulseIndicator, GeneratedMidiHub, LiveMidiClock, DockWorkspace, synth-player and adaptive-drums docs.
+Windows MIDI Services remains a candidate backend. Capability and cancellation behavior must be measured before replacing WinMM. Large SysEx, external sync, Link and device parameter profiles remain outside the current implementation.
 
-Reuse candidates: pure drummer/persona planning, synth role logic, MIDI codecs/export, channel ownership concepts and timing diagnostics. Assess dependencies and tests before moving source into a shared package. Do not import ASIO, audio transcription, voice capture or the whole application shell.
+## MusicSessionTrace reuse
 
-Observed constraints: BeatPulseIndicator/BeatPulseFrame assume four beats. GeneratedMidiHub serializes sends under a common lock; it is not a priority scheduler and its realtime lease API only accepts F8/FA/FC. Existing synth docs defer meter/swing alignment and full traffic scheduling. These are reasons for explicit new abstractions rather than wholesale copying.
-
-No shared package or cross-repository modification has been made in this scaffold.
+The deterministic drummer planner and personas were ported into Generation, with golden-output specifications for 4/4, 3/4 and 6/8. New grouped-meter recipes have explicit versioning. Adaptive audio followers and the original application's shared timing/UI infrastructure were not copied. MusicSessionTrace itself was not modified.

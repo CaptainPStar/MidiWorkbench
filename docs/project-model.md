@@ -1,36 +1,37 @@
 # Project model
 
-## Implemented schema 1
+## Project schema 3
 
-SongProject → Sections → Parts → Pattern → MidiNotes. Outline owns meter, bars, scale, root, density, intensity, variation and seed. Each part owns a logical destination and one-based channel. PatternKind is Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock.
+`SongProject` owns a stable ID, name, quarter-note BPM, sections and an optional arrangement. Arrangement entries reference section IDs and repeat counts; an empty arrangement uses section order. Projects migrate from schemas 1 and 2 on load. Unknown schemas and unknown JSON properties fail visibly.
 
-Data uses immutable collections. The compiler produces a plan consumed by one transport owner. Project loading validates musical bounds and refuses unsupported schema versions. No compatibility or migration promise is made for pre-release schema 1.
+Each section embeds an outline and parts. The outline specifies meter, bars, root, scale, density, intensity, variation and seed. Parts own logical destinations, one-based channels, mute/solo flags and a pattern. Physical endpoints never belong to the project.
 
-The demonstration generator creates four named roles. Its Pad is a sustained single note, not a completed chord/voice-leading generator. Drums are a simple seeded grid, not the MusicSessionTrace synthetic drummer. Pulse is a scale sequence, not a completed input-driven arpeggiator.
+Patterns are Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock. Added and recorded notes are locked. Deleting a note freezes its pattern to preserve the deletion. The pattern-kind control explicitly converts it back when regeneration is wanted. Undo/redo covers accepted project edits.
 
-## Planned schema expansion
+Recipes retain generator ID/version, PRNG, seed and settings. Configurable settings include source-note snapshots, step controls, pitch range, gate, probability, ratchets, swing, chord progression and meter grouping. Accepted notes are persisted: reopening does not require the generator or recompute notes. Unknown recipe versions cannot regenerate silently. Legacy drummer recipes retain the original algorithm; new grouped recipes preserve their version separately.
 
-| Object | Responsibility |
-|---|---|
-| Rig | Endpoint bindings, controller mappings, timing offsets and device capabilities |
-| Track | Stable musical part, input source, processors and output destination |
-| Pattern | Fixed notes, a generator recipe or a hybrid with edits/locks |
-| Scene | Coordinated pattern selections and macro values |
-| Section | Length, harmony/development, scene/material references and transitions |
-| Song | Section ordering and optional arrangement timeline |
-| Bank / setlist | Reusable collection and performance order |
-| Take | Captured inputs, emitted outputs and performance journal |
+Generation candidates are separate section snapshots tied to the source project. Audition does not accept a candidate. Acceptance validates the revision and creates one undoable change. Scoped generation leaves other parts and protected material alone.
 
-Track identity should ultimately be project-wide rather than duplicated per section. The compact scaffold embeds parts per section; introduce migration when scene/track references are implemented. Do not silently reinterpret existing IDs.
+## Rig schema 1
 
-Recipe metadata: generator ID/version, stable PRNG algorithm/version, seed per part, source motif references, constraints, scope and accepted candidate. A seed alone does not preserve a live performance or guarantee compatibility across algorithm changes.
+The local rig stores endpoints, clock toggles, delay (0–100 ms), destination routes, optional channel overrides and keyboard input. Clock-only endpoints work without a musical route. Project-wide resolution gives section launches a stable port/destination map. Editing a project or opening a bank never implicitly changes the rig.
 
-Manual edits need explicit override records and deletion tombstones. Until these exist, added notes are locked, changed notes can be locked, and deletion freezes the whole pattern. Warn/document this behavior instead of recreating deleted notes on the next Generate.
+WinMM endpoint IDs use name plus occurrence because that API does not supply stable identities. Identical-device reordering and renamed devices require checking the rig.
 
-Development curves use musical time and typed parameter IDs. Density, intensity and variation are distinct. Optional device mappings translate a parameter into configured CC/NRPN/SysEx messages. No universal filter/FM mapping is assumed. Untransmitted synth changes and synthesis remain out of scope.
+## Bank schema 1
 
-## Capture
+A `SongBank` holds independent project snapshots and an ordered list of bank-song IDs. The order can repeat songs. Add current snapshots the project; Update explicitly replaces a selected snapshot. Opening a bank song does not start it. Nested projects migrate through the normal project loader.
 
-PerformanceTake records timestamped emitted messages in seconds from transport start, initial BPM, tempo-change records and completeness. The current sink is memory only. Input recording and performance-action journals are future streams. Exported captures never claim that the hardware sounded at the recorded submission timestamp.
+## Take schema 2
 
-Separate source input, processed output and commands to avoid feedback or double-processing during replay. SMF export needs a tempo map; preserve wall time and transport gaps explicitly. Store JSON sidecars for events that do not map naturally into SMF. Device patches are optional references, not mandatory recall requirements.
+A `PerformanceTake` preserves separate input MIDI, submitted output MIDI and actions, with initial tempo, tempo changes and a completeness flag. Optional meter and project identity metadata preserve compatibility with older schema-2 takes. Input time is host arrival; immediate output time is submission, and scheduled output time is its requested delivery deadline. These are not acoustic onset measurements.
+
+Thru is captured after channel routing with a logical destination. Cancelled future output is removed when cancellation succeeds. Input loss and bounded capture/journal exhaustion invalidate completeness. Ordinary Stop waits for pending releases before a completed take is archived. Completed takes can be persisted automatically and recovered on startup; active recording is still bounded in memory.
+
+Take replay uses captured output timing, including controller and clock messages. Musical destinations resolve through the current rig. Endpoint-only output needs an unambiguous binding or explicit mapping; clock-only outputs remain independent of musical routes. Inputs remain a separate source stream, not a second copy of replayed thru.
+
+SMF type-1 export uses 960 PPQ. Song export preserves arrangement repeats and meter changes. Take export converts captured times through the tempo map and includes separate input and output tracks. Select the desired tracks in a DAW to avoid playing the same keyboard performance twice.
+
+## Extension boundaries
+
+Sections currently embed their own parts; project-wide shared pattern pools and arbitrary per-track clip scenes need a later schema. Deletion tombstones, development curves and richer live processors are later work. Device profiles for CC/NRPN/SysEx and external clock following remain optional extensions. Synth patch recall is not required.

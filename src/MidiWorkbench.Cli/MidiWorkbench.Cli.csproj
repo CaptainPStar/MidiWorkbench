@@ -1,1 +1,1 @@
-<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup><ItemGroup><ProjectReference Include="../MidiWorkbench.Application/MidiWorkbench.Application.csproj" /></ItemGroup></Project>
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup><ItemGroup><ProjectReference Include="../MidiWorkbench.Application/MidiWorkbench.Application.csproj" /><ProjectReference Include="../MidiWorkbench.Midi.Windows/MidiWorkbench.Midi.Windows.csproj" /></ItemGroup></Project>

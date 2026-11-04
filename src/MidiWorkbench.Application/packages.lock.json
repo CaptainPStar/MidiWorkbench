@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net10.0": {
+      "midiworkbench.domain": {
+        "type": "Project"
+      },
+      "midiworkbench.engine": {
+        "type": "Project",
+        "dependencies": {
+          "MidiWorkbench.Domain": "[1.0.0, )"
+        }
+      },
+      "midiworkbench.generation": {
+        "type": "Project",
+        "dependencies": {
+          "MidiWorkbench.Domain": "[1.0.0, )"
+        }
+      },
+      "midiworkbench.persistence": {
+        "type": "Project",
+        "dependencies": {
+          "MidiWorkbench.Domain": "[1.0.0, )"
+        }
+      }
+    }
+  }
+}

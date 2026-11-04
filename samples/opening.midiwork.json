@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "Opening",
   "bpm": 120,
   "sections": [
@@ -10,7 +10,8 @@
         "bars": 4,
         "meter": {
           "numerator": 4,
-          "denominator": 4
+          "denominator": 4,
+          "barTicks": 3840
         },
         "root": 40,
         "scale": [
@@ -25,7 +26,8 @@
         "density": 0.35,
         "intensity": 0.5,
         "variation": 0.25,
-        "seed": 1
+        "seed": 1,
+        "lengthTicks": 15360
       },
       "parts": [
         {
@@ -44,7 +46,8 @@
                 "duration": 480,
                 "pitch": 52,
                 "velocity": 80,
-                "locked": true
+                "locked": true,
+                "endTick": 480
               },
               {
                 "id": "motif-2",
@@ -52,7 +55,8 @@
                 "duration": 480,
                 "pitch": 53,
                 "velocity": 70,
-                "locked": true
+                "locked": true,
+                "endTick": 1440
               },
               {
                 "id": "motif-3",
@@ -60,7 +64,8 @@
                 "duration": 960,
                 "pitch": 59,
                 "velocity": 90,
-                "locked": true
+                "locked": true,
+                "endTick": 2880
               }
             ]
           }

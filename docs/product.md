@@ -2,6 +2,8 @@
 
 The application controls external instruments through MIDI and provides a dependable clock. It supports live performance, jamming, song development and MIDI studio capture. It does not produce or record audio.
 
+Generation and live orchestration are the primary development priorities. A DAW or MusicSessionTrace can capture the performance. Built-in MIDI recording remains useful for turning keyboard phrases into material, but expanding durable performance capture is deferred.
+
 ## Confirmed scope
 
 - .NET 10; independent application with reusable components from MusicSessionTrace considered individually.
