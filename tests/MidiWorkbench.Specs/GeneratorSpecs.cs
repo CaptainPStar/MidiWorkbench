@@ -247,11 +247,11 @@ public static class GeneratorSpecs
                 Progression = [0, 3, 4], Grouping = [2, 2, 3], Direction = ArpeggioDirection.Random,
                 SourceNotes = kind == GeneratorKind.Arpeggiator ? [new("c", 0, 960, 60, 80), new("e", 0, 960, 64, 80), new("f", 960, 960, 65, 80)] : [] };
             text.Append($"{kind}/{seed}:");
-            foreach (var note in Generator.Generate(outline, settings).Notes) text.Append($"{note.Tick},{note.Duration},{note.Pitch},{note.Velocity};");
+            foreach (var note in Generator.Generate(outline, settings, version: PatternGenerator.LegacyVersion).Notes) text.Append($"{note.Tick},{note.Duration},{note.Pitch},{note.Velocity};");
             text.Append('\n');
         }
         var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString())));
-        Check(digest == "28BFBA564BE1D038B996EA526C50990DD040144F950DE104F5784C37D0EB19C1", $"{PatternGenerator.Version} output changed: {digest}");
+        Check(digest == "28BFBA564BE1D038B996EA526C50990DD040144F950DE104F5784C37D0EB19C1", $"{PatternGenerator.LegacyVersion} output changed: {digest}");
     }
 
     private static void StrictValidation()

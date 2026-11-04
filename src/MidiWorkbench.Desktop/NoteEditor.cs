@@ -5,6 +5,7 @@ using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Media;
+using Avalonia.Threading;
 using Avalonia.VisualTree;
 using MidiWorkbench.Domain;
 using MidiWorkbench.Application;
@@ -50,6 +51,7 @@ internal sealed class NoteEditor : Control
     public bool ReadOnly { get; set; }
     public int NewVelocity { get; set; } = 90;
     public long NewDuration { get; set; } = 240;
+    public bool NewLocked { get; set; } = true;
     public long SnapTicks { get => snap; set { snap = Math.Max(1, value); InvalidateVisual(); } }
     public double Zoom { get => pixelsPerQuarter; set { pixelsPerQuarter = Math.Clamp(value, 24, 240); Resize(); } }
     public double Playhead { get => playhead; set { if (Math.Abs(playhead - value) > .01) { playhead = value; InvalidateVisual(); } } }
@@ -69,7 +71,8 @@ internal sealed class NoteEditor : Control
     public void Show(Part? value, Outline? section, bool drums, string? sectionId = null)
     {
         var changed = part?.Id != value?.Id || sectionIdentity != sectionId || DrumMode != drums;
-        if (!ReferenceEquals(part?.Pattern, value?.Pattern)) { captured?.Capture(null); CancelGesture(); }
+        var patternChanged = !ReferenceEquals(part?.Pattern, value?.Pattern);
+        if (patternChanged) { captured?.Capture(null); CancelGesture(); }
         sectionIdentity = sectionId;
         part = value; outline = section; DrumMode = drums;
         lanes = drums ? new[] { 49, 51, 46, 42, 44, 39, 38, 40, 50, 48, 47, 45, 43, 41, 36, 35 }
@@ -82,6 +85,7 @@ internal sealed class NoteEditor : Control
         selection.RemoveWhere(id => !valid.Contains(id));
         if (SelectedId is not null && !selection.Contains(SelectedId)) SelectedId = selection.FirstOrDefault();
         Resize();
+        if (changed || patternChanged) SelectionChanged?.Invoke(part?.Pattern.Notes.FirstOrDefault(n => n.Id == SelectedId));
     }
     public void Select(string? id) => SelectMany(id is null ? [] : [id], id);
     public void SelectMany(IEnumerable<string> ids, string? primary = null)
@@ -129,7 +133,8 @@ internal sealed class NoteEditor : Control
         var velocity = NoteSelectionEdits.SetVelocity(resized, selection, outline.LengthTicks, edited.Velocity);
         PublishPattern(NoteSelectionEdits.SetLocked(velocity, selection, outline.LengthTicks, edited.Locked), selection.ToArray());
     });
-    public void Add(MidiNote note) { if (!ReadOnly) Publish([note], [], [note.Id]); }
+    public void Add(MidiNote note) => Add(note, reveal: true);
+    private void Add(MidiNote note, bool reveal) { if (!ReadOnly) Publish([note], [], [note.Id], reveal); }
     private void PublishCopies(Pattern pattern)
     {
         var existing = part!.Pattern.Notes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
@@ -138,14 +143,64 @@ internal sealed class NoteEditor : Control
     }
     private bool PublishPattern(Pattern pattern, IEnumerable<string> selected) =>
         Publish(pattern.Notes, part!.Pattern.Notes.Select(n => n.Id).Except(pattern.Notes.Select(n => n.Id)), selected);
-    private bool Publish(IEnumerable<MidiNote> notes, IEnumerable<string> deleted, IEnumerable<string> selected)
+    private bool Publish(IEnumerable<MidiNote> notes, IEnumerable<string> deleted, IEnumerable<string> selected, bool reveal = true)
     {
         var existing = part?.Pattern.Notes.ToDictionary(n => n.Id, StringComparer.Ordinal) ?? [];
         var changed = notes.Where(n => existing.GetValueOrDefault(n.Id) != n).ToImmutableArray();
         var removed = deleted.ToImmutableArray(); var ids = selected.ToImmutableArray();
         if (changed.IsEmpty && removed.IsEmpty) return false;
         if (CommitEdit?.Invoke(new(changed, removed, ids)) != true) return false;
-        SelectMany(ids, SelectedId); return true;
+        SelectMany(ids, SelectedId);
+        if (reveal) RevealSelection();
+        return true;
+    }
+    public void RevealSelection() => QueueReveal(material: false);
+    public void RevealMaterial() => QueueReveal(material: true);
+    private void QueueReveal(bool material)
+    {
+        var id = SelectedId; var selected = selection.ToHashSet(StringComparer.Ordinal); var pattern = part?.Pattern;
+        if ((!material && id is null) || pattern is null || pattern.Notes.IsEmpty) return;
+        // A commit can add a drum lane or resize the editor. Reveal after layout,
+        // and ignore requests superseded by another selection or edit.
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (SelectedId != id || !selection.SetEquals(selected) || !ReferenceEquals(part?.Pattern, pattern)) return;
+            var scroll = this.GetVisualAncestors().OfType<ScrollViewer>().FirstOrDefault();
+            if (scroll is null || scroll.Viewport.Width <= Labels || scroll.Viewport.Height <= Header) return;
+            var visible = new Rect(scroll.Offset.X + Labels, scroll.Offset.Y + Header,
+                scroll.Viewport.Width - Labels, scroll.Viewport.Height - Header);
+            var visibleNote = material && id is null ? pattern.Notes.FirstOrDefault(n => NoteRect(n).Intersects(visible)) : null;
+            var note = pattern.Notes.FirstOrDefault(n => n.Id == id) ?? visibleNote ?? (material ? pattern.Notes[0] : null);
+            if (note is null) return;
+            var bounds = NoteRect(note);
+            var top = bounds.Top; var bottom = bounds.Bottom;
+            // Frame the complete musical register when it fits. If a proposal is
+            // too wide, retain a useful manual view or fall back to its selection.
+            IEnumerable<MidiNote> spanNotes = material ? pattern.Notes : pattern.Notes.Where(n => selected.Contains(n.Id));
+            var spanTop = double.PositiveInfinity; var spanBottom = double.NegativeInfinity;
+            foreach (var item in spanNotes)
+            {
+                var rect = NoteRect(item); spanTop = Math.Min(spanTop, rect.Top); spanBottom = Math.Max(spanBottom, rect.Bottom);
+            }
+            if (spanBottom - spanTop <= visible.Height - 8) { top = spanTop; bottom = spanBottom; }
+            else if (material && id is null && visibleNote is not null) return;
+            else if (material && selected.Count > 1)
+            {
+                spanTop = double.PositiveInfinity; spanBottom = double.NegativeInfinity;
+                foreach (var item in pattern.Notes.Where(n => selected.Contains(n.Id)))
+                {
+                    var rect = NoteRect(item); spanTop = Math.Min(spanTop, rect.Top); spanBottom = Math.Max(spanBottom, rect.Bottom);
+                }
+                if (spanBottom - spanTop <= visible.Height - 8) { top = spanTop; bottom = spanBottom; }
+            }
+            // Long notes reveal their start; the sticky ruler and pitch labels
+            // must not cover the selected note after scrolling.
+            var focus = new Rect(new Point(bounds.Left, top), new Size(Math.Min(bounds.Width, Math.Max(1, visible.Width - 8)),
+                Math.Min(bottom - top, Math.Max(1, visible.Height - 8))));
+            if (focus.Left >= visible.Left && focus.Top >= visible.Top && focus.Right <= visible.Right && focus.Bottom <= visible.Bottom) return;
+            this.BringIntoView(new Rect(Math.Max(0, focus.Left - Labels - 4), Math.Max(0, focus.Top - Header - 4),
+                Math.Min(scroll.Viewport.Width, focus.Width + Labels + 8), Math.Min(scroll.Viewport.Height, focus.Height + Header + 8)));
+        }, DispatcherPriority.Loaded);
     }
     private void Command(Action command) { try { command(); } catch (Exception ex) { Error?.Invoke(ex); } }
     public double SuggestedOffset => DrumMode ? 0 : Math.Max(0, Header + (127 - (part?.Pattern.Notes.Select(n => n.Pitch).DefaultIfEmpty(60).Max() ?? 60) - 2) * Lane);
@@ -329,10 +384,10 @@ internal sealed class NoteEditor : Control
         CancelGesture(); e.Pointer.Capture(null);
         if (add && outline is not null)
         {
-            var note = new MidiNote(Guid.NewGuid().ToString("N"), at, Math.Min(Math.Max(1, NewDuration), outline.LengthTicks - at), PitchAt(pos.Y), NewVelocity, true);
-            Add(note); insertTick = note.EndTick;
+            var note = new MidiNote(Guid.NewGuid().ToString("N"), at, Math.Min(Math.Max(1, NewDuration), outline.LengthTicks - at), PitchAt(pos.Y), NewVelocity, NewLocked);
+            Add(note, reveal: false); insertTick = note.EndTick;
         }
-        else if (changed.Length > 0) Publish(changed, [], selected);
+        else if (changed.Length > 0) Publish(changed, [], selected, reveal: false);
         InvalidateVisual(); e.Handled = true;
     }
     private void CancelGesture()
@@ -366,7 +421,7 @@ internal sealed class NoteEditor : Control
         if (e.Key is Key.Home or Key.End || selection.Count == 0 && e.Key is Key.Left or Key.Right or Key.Up or Key.Down)
         {
             var n = e.Key == Key.End ? part?.Pattern.Notes.LastOrDefault() : part?.Pattern.Notes.FirstOrDefault();
-            if (n is not null) { Select(n.Id); this.BringIntoView(NoteRect(n)); }
+            if (n is not null) { Select(n.Id); RevealSelection(); }
             e.Handled = true; return;
         }
         if (ReadOnly || outline is null || SelectedNotes.IsEmpty) return;

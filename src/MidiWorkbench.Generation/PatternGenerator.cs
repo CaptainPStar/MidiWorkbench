@@ -6,12 +6,17 @@ namespace MidiWorkbench.Generation;
 public sealed class PatternGenerator
 {
     public const string GeneratorId = "pattern";
-    public const string Version = "pattern-1";
+    public const string Version = "pattern-2";
+    public const string LegacyVersion = "pattern-1";
     public const string RandomId = "xorshift32";
     private const int MaxNotes = 100000;
 
-    public Pattern Generate(Outline outline, GeneratorSettings settings, Pattern? previous = null)
+    // Explicit settings create a current recipe. Stored-recipe callers pass its version.
+    public Pattern Generate(Outline outline, GeneratorSettings settings, Pattern? previous = null, string? version = null)
     {
+        version ??= Version;
+        if (version is not (Version or LegacyVersion)) throw new InvalidOperationException($"Unsupported pattern algorithm: {version}.");
+        var legacy = version == LegacyVersion;
         ArgumentNullException.ThrowIfNull(outline); ArgumentNullException.ThrowIfNull(settings);
         outline.Validate(); settings.Validate();
         var grouping = MeterGrouping.Resolve(outline.Meter, settings.Grouping);
@@ -19,7 +24,7 @@ public sealed class PatternGenerator
         if (previous?.Kind == PatternKind.Fixed) return previous;
         var pitches = Enumerable.Range(settings.MinPitch, settings.MaxPitch - settings.MinPitch + 1)
             .Where(p => outline.Scale.Contains(Mod(p - outline.Root, 12))).ToArray();
-        if (pitches.Length == 0) throw new ArgumentException("Pitch range contains no scale notes.");
+        if (pitches.Length == 0) throw new ArgumentException(legacy ? "Pitch range contains no scale notes." : "Widen the pitch range; it contains no scale notes.");
         var seed = settings.Seed ?? outline.Seed;
         var random = new SeededRandom(MixSeed(seed, settings.PartSeed));
         var notes = new List<MidiNote>();
@@ -45,22 +50,38 @@ public sealed class PatternGenerator
         var accents = new HashSet<long>(); long groupTick = 0;
         foreach (var group in grouping) { accents.Add(groupTick); groupTick += group * MusicalTime.Ppq * 4L / outline.Meter.Denominator; }
         var scale = outline.Scale.Order().ToArray();
-        int Degree(int degree)
+        var degreeCache = new Dictionary<int, int>();
+        int RawDegree(int degree)
         {
             var octave = (int)Math.Floor(degree / (double)scale.Length);
-            return Snap(outline.Root + 12 * octave + scale[Mod(degree, scale.Length)]);
+            return outline.Root + 12 * octave + scale[Mod(degree, scale.Length)];
+        }
+        int Degree(int degree)
+        {
+            if (legacy) return Snap(RawDegree(degree));
+            if (!degreeCache.TryGetValue(degree, out var pitch))
+                degreeCache[degree] = pitch = HarmonicPlacement.Single(RawDegree(degree), settings.MinPitch, settings.MaxPitch);
+            return pitch;
         }
         int Snap(int pitch) => pitches.MinBy(p => Math.Abs(p - pitch));
+        int SourcePitch(int pitch)
+        {
+            var octave = (int)Math.Floor((pitch - outline.Root) / 12d);
+            return Enumerable.Range(octave - 1, 3).SelectMany(o => scale.Select(s => outline.Root + 12 * o + s))
+                .OrderBy(p => Math.Abs(p - pitch)).ThenBy(p => p).First();
+        }
         int Value(ImmutableArray<int> values, int index, int fallback) => values.IsEmpty ? fallback : values[index % values.Length];
         double Probability(int index) => settings.Probability * (settings.StepProbabilities.IsEmpty ? 1 : settings.StepProbabilities[index % settings.StepProbabilities.Length]) * outline.Density;
         var walkIndex = Array.IndexOf(pitches, Snap(outline.Root));
         var source = settings.SourceNotes.OrderBy(n => n.Tick).ThenBy(n => n.Pitch).ToArray();
         var sourceOrder = settings.SourceNotes.Select((n, i) => (n.Id, Index: i)).ToDictionary(n => n.Id, n => n.Index, StringComparer.Ordinal);
         var sourceLength = settings.SourceLengthTicks ?? (source.Length == 0 ? outline.Meter.BarTicks : source.Max(n => n.EndTick));
-        var materialCursor = new MaterialCursor(source, sourceOrder, Snap, settings.Direction == ArpeggioDirection.AsPlayed);
+        var materialCursor = new MaterialCursor(source, sourceOrder, legacy ? Snap : static p => p, settings.Direction == ArpeggioDirection.AsPlayed);
+        int[]? degreeMaterial = null, lastMaterial = null, lastExpanded = null;
         int[] Material(long tick)
         {
-            if (source.Length == 0) return settings.ChordDegrees.Select(Degree).Distinct().ToArray();
+            if (source.Length == 0) return legacy ? settings.ChordDegrees.Select(Degree).Distinct().ToArray()
+                : degreeMaterial ??= settings.ChordDegrees.Select(RawDegree).Distinct().ToArray();
             return materialCursor.At(tick % sourceLength);
         }
         void Emit(long tick, long cellEnd, int pitch, int velocity, int ratchets, int ordinal, int voice, bool accent)
@@ -103,7 +124,15 @@ public sealed class PatternGenerator
             {
                 case GeneratorKind.Arpeggiator:
                     var material = Material(tick);
-                    var expanded = Enumerable.Range(0, settings.Octaves).SelectMany(o => material.Select(p => Snap(p + 12 * o))).Distinct().ToArray();
+                    int[] expanded;
+                    if (legacy) expanded = Enumerable.Range(0, settings.Octaves).SelectMany(o => material.Select(p => Snap(p + 12 * o))).Distinct().ToArray();
+                    else if (ReferenceEquals(material, lastMaterial)) expanded = lastExpanded!;
+                    else
+                    {
+                        var raw = Enumerable.Range(0, settings.Octaves).SelectMany(o => material.Select(p => p + 12 * o)).Distinct().ToArray();
+                        expanded = HarmonicPlacement.Voices(source.Length > 0 ? raw.Select(SourcePitch).ToArray() : raw, settings.MinPitch, settings.MaxPitch);
+                        lastMaterial = material; lastExpanded = expanded;
+                    }
                     if (settings.Direction != ArpeggioDirection.AsPlayed) Array.Sort(expanded);
                     var index = settings.Direction switch
                     {
@@ -131,8 +160,15 @@ public sealed class PatternGenerator
                 case GeneratorKind.Chord:
                 case GeneratorKind.Pad:
                     var progression = settings.Progression[ordinal % settings.Progression.Length];
-                    voices = source.Length > 0 ? Material(tick) : settings.ChordDegrees.Select(d => Degree(d + progression)).Distinct().Order().ToArray();
-                    if (previousChord is not null && source.Length == 0)
+                    voices = source.Length > 0 ? Material(tick)
+                        : settings.ChordDegrees.Select(d => legacy ? Degree(d + progression) : RawDegree(d + progression)).Distinct().Order().ToArray();
+                    if (!legacy)
+                    {
+                        voices = HarmonicPlacement.Voices(source.Length > 0 ? voices.Select(SourcePitch).ToArray() : voices,
+                            settings.MinPitch, settings.MaxPitch, source.Length == 0 ? previousChord : null);
+                        Array.Sort(voices);
+                    }
+                    else if (previousChord is not null && source.Length == 0)
                     {
                         voices = voices.Select((pitch, i) => pitches.Where(p => Mod(p - pitch, 12) == 0)
                             .MinBy(p => Math.Abs(p - previousChord[Math.Min(i, previousChord.Length - 1)]))).Distinct().Order().ToArray();
@@ -150,7 +186,7 @@ public sealed class PatternGenerator
         notes.AddRange(locks);
         return new(previous?.Id ?? "generated", locks.Length > 0 ? PatternKind.Hybrid : PatternKind.Generative,
             notes.OrderBy(n => n.Tick).ThenBy(n => n.Pitch).ThenBy(n => n.Id, StringComparer.Ordinal).ToImmutableArray())
-        { Recipe = new(GeneratorId, Version, RandomId, seed) { Settings = settings } };
+        { Recipe = new(GeneratorId, version, RandomId, seed) { Settings = settings } };
     }
 
     public Pattern Regenerate(Outline outline, Pattern previous)
@@ -164,13 +200,13 @@ public sealed class PatternGenerator
         ValidateRecipe(recipe);
         var settings = recipe.Settings ?? throw new InvalidOperationException("Pattern recipe has no settings.");
         // The recipe seed captures the original outline seed when no per-part override was set.
-        return Generate(outline with { Seed = recipe.Seed }, settings, previous);
+        return Generate(outline with { Seed = recipe.Seed }, settings, previous, recipe.Version);
     }
 
     public static void ValidateRecipe(Recipe recipe)
     {
         ArgumentNullException.ThrowIfNull(recipe);
-        if (recipe.Generator != GeneratorId || recipe.Version != Version || recipe.Random != RandomId)
+        if (recipe.Generator != GeneratorId || recipe.Version is not (Version or LegacyVersion) || recipe.Random != RandomId)
             throw new InvalidOperationException($"Unsupported generator recipe: {recipe.Generator}/{recipe.Version}/{recipe.Random}.");
         if (recipe.Settings is null) throw new InvalidOperationException("Pattern recipe has no settings.");
         recipe.Settings.Validate();

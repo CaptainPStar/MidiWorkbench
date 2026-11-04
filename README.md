@@ -47,13 +47,14 @@ Or `bash scripts/publish.sh win-x64`. Output is under `artifacts/win-x64/`. Run 
 ## First session
 
 1. The output bar identifies simulation, missing routes and MIDI outputs. Simulation sends no MIDI to instruments. Open Routing, assign each destination an output and channel, choose the input, enable Clock where wanted, then Apply routing.
-2. Outline: set meter, root, scale and musical amounts. Preview a section or a part generator. Audition, then Accept or Discard.
-3. Patterns: click empty space to add a note; drag it to move, or drag its right edge to resize. Right-click/Delete removes. Start beat is counted from 1; length is in quarter-note beats (0.25 = a sixteenth note), independent of meter. Pitch shows the note name and MIDI number. Locked notes survive regeneration. Pattern kind explicitly controls Fixed/Hybrid/Generative behavior.
-4. Perform: arm a part or New part, then play the section. Stop commits keyboard notes. Arm changes require stopped playback.
-5. Arrange sections with repeats or queue a section at a beat/bar boundary. Song banks hold reusable project snapshots and setlist order.
-6. Save the project, export the song as MIDI, or recall a captured take. A DAW or MusicSessionTrace can capture the performance; built-in recording remains available for phrase development.
+   Use **New song** to start a fresh, empty four-part project without changing the rig or bank. The existing song and unapplied changes are protected by confirmation.
+2. Outline: use Rename section to change a section's name without regenerating its material. Set meter, root, scale and musical amounts; Preview section then Accept applies those musical changes. Preview a part generator using a note value, triplet, dotted note or custom quarter-note beats for its step length. Part generators use the accepted section density alongside their local probability. Audition, then Accept or Discard.
+3. Patterns: click empty space to add a note; drag it to move, or drag its right edge to resize. Right-click/Delete removes. Start beat is counted from 1; length is in quarter-note beats (0.25 = a sixteenth note), independent of meter. Pitch shows the note name and MIDI number. Lock starts checked. Selecting a note loads its lock state; field and grid additions use the currently displayed setting. Locked notes survive regeneration. Pattern kind explicitly controls Fixed/Hybrid/Generative behavior.
+4. Perform: arm a part or New part, then use Record section. Both start actions record while a target is armed. Stop keeps the keyboard notes. Arm changes require stopped playback.
+5. Arrange sections with repeats or queue a section at a beat/bar boundary. The playback status names the sounding section independently of the editor selection, and identifies previews, take replay and recording. Use Rename song to give each project a recognizable title. Song banks hold reusable project snapshots and setlist order; New bank and Rename bank set the bank title.
+6. Save the project, export MIDI, or recall a captured take. Export MIDI offers the song order or selected section and defaults to current routing channel overrides; choose stored project channels to ignore them. Missing overrides fall back to part channels; endpoint availability and delay do not change the file. A DAW or MusicSessionTrace can capture the performance; built-in recording remains available for phrase development.
 
-See [live generation and editing](docs/live-generation.md) for audition, variation, cancellation and keyboard controls.
+See [live generation and editing](docs/live-generation.md) for audition, variation, cancellation and keyboard controls, and [MIDI export](docs/export-midi.md) for channel policies and CLI options.
 
 Save writes the accepted project. An unaccepted preview is separate and is not included until accepted. Closing or opening another project prompts for unsaved project/bank changes and unaccepted section changes. Save remembers the file path; Save as writes another file. Stopping and editing retain unapplied section settings until the accepted outline or selected section changes.
 
@@ -72,7 +73,7 @@ The Perform pane shows recent takes. **Save selected** writes the selected recor
 
 `scripts/verify.ps1` also renders the desktop offscreen and exercises its controls without sending OS input. Images and results are written to `artifacts/desktop-ux`. Tests isolate local settings using `MIDIWORKBENCH_SETTINGS_DIRECTORY`; ordinary launches use `%LOCALAPPDATA%\MidiWorkbench`.
 
-Arpeggiators can use captured notes as their source. Generator settings preserve that material in the recipe. Change only the part you intend to vary; Fixed material remains protected until explicitly converted.
+Arpeggiators can use captured notes as their source. Generator settings preserve that material in the recipe. Change only the part you intend to vary; Fixed material remains protected until explicitly converted. New chord and arpeggio recipes preserve harmonic tones when fitting the pitch range; widen the range if all requested voices cannot fit. Saved older recipes keep their original algorithm until you explicitly preview and accept new part settings.
 
 ## CLI
 

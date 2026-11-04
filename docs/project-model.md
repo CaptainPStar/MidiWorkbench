@@ -6,9 +6,11 @@
 
 Each section embeds an outline and parts. The outline specifies meter, bars, root, scale, density, intensity, variation and seed. Parts own logical destinations, one-based channels, mute/solo flags and a pattern. Physical endpoints never belong to the project.
 
-Patterns are Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock. Added and recorded notes are locked. Deleting a note freezes its pattern to preserve the deletion. The pattern-kind control explicitly converts it back when regeneration is wanted. Undo/redo covers accepted project edits.
+Patterns are Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock. Recorded notes are locked. Manual field and grid additions use the visible Lock setting: it starts checked, and selecting a note loads that note's lock state. Unlocked additions can be replaced by regeneration; locked notes remain protected. Deleting a note freezes its pattern to preserve the deletion. The pattern-kind control explicitly converts it back when regeneration is wanted. Undo/redo covers accepted project edits.
 
 Recipes retain generator ID/version, PRNG, seed and settings. Configurable settings include source-note snapshots, step controls, pitch range, gate, probability, ratchets, swing, chord progression and meter grouping. Accepted notes are persisted: reopening does not require the generator or recompute notes. Unknown recipe versions cannot regenerate silently. Legacy drummer recipes retain the original algorithm; new grouped recipes preserve their version separately.
+
+Configurable `pattern-1` recipes retain their original output on recipe regeneration, outline regeneration and whole-section variation. New explicit part-settings generation creates `pattern-2` material: harmonic pitch classes are placed by octave within the chosen range, and distinct octave voices share pitch slots without collisions. An impossible harmonic range is rejected with a request to widen it. Captured material is quantized to the scale before register placement. Opening a project never upgrades its algorithm; an explicit part preview can propose current-version material, which remains separate until accepted. Fixed patterns and locked edits keep their protection.
 
 Generation candidates are separate section snapshots tied to the source project. Audition does not accept a candidate. Acceptance validates the revision and creates one undoable change. Scoped generation leaves other parts and protected material alone.
 

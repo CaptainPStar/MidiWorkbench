@@ -38,7 +38,7 @@ public sealed class SectionGenerator
                 if (oldRecipe.Generator == PatternGenerator.GeneratorId)
                 {
                     PatternGenerator.ValidateRecipe(oldRecipe);
-                    parts.Add(old with { Pattern = new PatternGenerator().Generate(outline, oldRecipe.Settings!, old.Pattern) }); continue;
+                    parts.Add(old with { Pattern = new PatternGenerator().Generate(outline, oldRecipe.Settings!, old.Pattern, oldRecipe.Version) }); continue;
                 }
                 if (!(role == PartRole.Drums && (basicDrums || drummer is not null))) ValidateRecipe(oldRecipe);
             }
@@ -78,7 +78,7 @@ public sealed class SectionGenerator
                     (partIds is null || partIds.Contains(other.Id)))
                 {
                     PatternGenerator.ValidateRecipe(other.Pattern.Recipe);
-                    parts.Add(other with { Pattern = new PatternGenerator().Generate(outline, other.Pattern.Recipe.Settings!, other.Pattern) });
+                    parts.Add(other with { Pattern = new PatternGenerator().Generate(outline, other.Pattern.Recipe.Settings!, other.Pattern, other.Pattern.Recipe.Version) });
                 }
                 else parts.Add(other);
             }

@@ -1,5 +1,16 @@
 # Verification status
 
+## 2026-11-05 musical workflow refinement
+
+- At application revision `f884d1c`, locked restore and serial Release verification pass with zero warnings/errors: 61 core specification groups and 273 offscreen desktop checks.
+- Musical corrections preserve harmonic voices, note visibility, silent MIDI endings, explicit export channel choices, protected edits and true draft discard. Section rename changes metadata only. Song/bank identity and New song are usable through the desktop; scoped part preview remains reachable while editing lower generator fields.
+- Independent research-led, blind musical reviews exercised intentional sketches, captured phrases, related sections, live queue/audition controls, arrangement and bank recall. Reproduced findings were corrected and regression-tested. See the [musical workflow report](reports/musical-workflows-2026-11-04.md) for revision-specific evidence and acceptance bounds.
+- The final fresh Sol 6.1 review at `f884d1c` found no actionable production issue in its tested scope. Its 147 exported note pairs matched the accepted arrangement exactly; bank recall, protected Loopback capture, live audition/Return, queue cancellation, launch and F8 passed. This is bounded software acceptance, not physical or acoustic proof.
+- The current five-minute virtualMIDI run delivered 19,200 balanced note pairs and 14,400 clocks per approved port, with no late attacks, skipped clocks, ownership residue or endpoint errors. Sustain cleanup, shutdown and reopen passed. Capture correctly reported its planned 100,000-entry overflow while independent output traces remained intact.
+- Eighteen UI workload rounds passed 4,914 assertions; at least 299.929 of 300 seconds overlapped individual rounds. Clock-spacing error p99 was 0.873–0.887 ms, maximum 12.460 ms. Planned clock deadline-to-dispatch p99 was 0.997–1.133 ms, maximum 12.842 ms. These tails remain a limitation; no hard-real-time or physical synth certification is claimed.
+
+The sections below record earlier revisions and workloads. Native human/file-picker acceptance, acoustic results and physical-interface acceptance remain open.
+
 ## 2026-11-04 timing and workflow follow-up
 
 - Locked restore and serial Release verification pass with zero warnings/errors: 55 core specification groups and 100 offscreen desktop assertions.

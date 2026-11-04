@@ -16,8 +16,8 @@ const string usage = """
       upgrade PROJECT                rewrite in the current schema
       simulate PROJECT TAKE          synthetic timing, memory output
       simulate-song PROJECT TAKE     play the arranged song in memory
-      export PROJECT FILE.mid
-      export-song PROJECT FILE.mid
+      export PROJECT FILE.mid [--rig RIG.json]       default: stored project channels
+      export-song PROJECT FILE.mid [--rig RIG.json]
       sections PROJECT
       generate PROJECT SECTION PART SETTINGS.json OUTPUT
       vary PROJECT SECTION SEED OUTPUT
@@ -79,11 +79,21 @@ try
             var tempoMap = new TempoMap(exportTake.Bpm, exportTake.TempoChanges);
             ProjectStore.WriteAtomic(target, MidiFile.FromTake(exportTake, exportTake.Meter ?? new Meter(), tempoMap.TickAt, tempoMap.Changes));
             Console.WriteLine(target); return 0;
-        case ["export", var source, var target]:
-            var project = ProjectStore.Load(source);
-            ProjectStore.WriteAtomic(target, MidiFile.FromSection(project.Sections[0], project.Bpm)); Console.WriteLine(target); return 0;
-        case ["export-song", var source, var target]:
-            using (var session = new WorkbenchSession()) { session.Load(source); session.ExportArrangementMidi(target); }
+        case ["export", var source, var target, ..var exportOptions]:
+            var sectionRig = ExportRig(exportOptions);
+            using (var sectionSession = new WorkbenchSession())
+            {
+                sectionSession.Load(source);
+                sectionSession.ExportMidi(target, sectionRig is null ? ExportChannelMode.ProjectChannels : ExportChannelMode.RoutingOverrides, sectionRig);
+            }
+            Console.WriteLine(target); return 0;
+        case ["export-song", var source, var target, ..var songOptions]:
+            var songRig = ExportRig(songOptions);
+            using (var session = new WorkbenchSession())
+            {
+                session.Load(source);
+                session.ExportArrangementMidi(target, songRig is null ? ExportChannelMode.ProjectChannels : ExportChannelMode.RoutingOverrides, songRig);
+            }
             Console.WriteLine(target); return 0;
         case ["bank-create", var bankPath, ..var sources] when sources.Length > 0:
             var bankSongs = sources.Select(path => new BankSong(Guid.NewGuid().ToString("N"), ProjectStore.Load(path))).ToImmutableArray();
@@ -116,6 +126,14 @@ catch (Exception ex) when (ex is IOException or ArgumentException or InvalidOper
 { Console.Error.WriteLine(ex.Message); return 2; }
 
 static IMidiBackend Backend() => WindowsMidi.CreateBackend() is { } windows ? new CompositeBackend(new MemoryBackend(), windows) : new MemoryBackend();
+
+// Export consumes routing data only. It never installs the rig or opens its input/output devices.
+static Rig? ExportRig(string[] options) => options switch
+{
+    [] => null,
+    ["--rig", var path] => ProjectStore.LoadRig(path),
+    _ => throw new ArgumentException("Export options: --rig RIG.json (channel overrides only).")
+};
 
 static int Simulate(SongProject p, string target, bool song = false)
 {

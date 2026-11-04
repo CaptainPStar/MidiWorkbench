@@ -19,6 +19,31 @@ public sealed partial class MainWindow
     private bool ProjectChanged => !ReferenceEquals(savedProject, session.Project);
     private bool BankChanged => session.Bank is not null && !ReferenceEquals(savedBank, session.Bank);
 
+    private sealed record MidiExportOptions(bool SongOrder, bool CurrentRouting);
+
+    private async Task<MidiExportOptions?> ChooseMidiExport()
+    {
+        var dialog = new Window { Title = "Export MIDI", Width = 420, SizeToContent = SizeToContent.Height, CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false };
+        dialog.AddHandler(KeyDownEvent, HandleShortcuts, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        var scope = new ComboBox { ItemsSource = new[] { "Song order", "Selected section" }, SelectedIndex = 0, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var channels = new ComboBox { ItemsSource = new[] { "Current routing channels", "Stored project channels" }, SelectedIndex = 0, HorizontalAlignment = HorizontalAlignment.Stretch };
+        Avalonia.Automation.AutomationProperties.SetName(scope, "Export scope");
+        Avalonia.Automation.AutomationProperties.SetName(channels, "Export channels");
+        ToolTip.SetTip(channels, "Current routing uses channel overrides where set, otherwise part channels. Endpoint availability and delay do not affect the MIDI file.");
+        var cancel = new Button { Content = "Cancel", IsCancel = true };
+        var confirm = new Button { Content = "Choose file", IsDefault = true };
+        cancel.Click += (_, _) => dialog.Close(null);
+        confirm.Click += (_, _) => dialog.Close(new MidiExportOptions(scope.SelectedIndex == 0, channels.SelectedIndex == 0));
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right, Children = { cancel, confirm } };
+        dialog.Content = new StackPanel { Margin = new Thickness(20), Spacing = 12, Children =
+        {
+            new TextBlock { Text = "Export" }, scope, new TextBlock { Text = "Channels" }, channels, buttons
+        } };
+        dialog.Opened += (_, _) => scope.Focus();
+        return await dialog.ShowDialog<MidiExportOptions?>(this);
+    }
+
     private void StartSong()
     {
         playback = session.Armed is null ? "song" : "section";
@@ -27,7 +52,100 @@ public sealed partial class MainWindow
         else session.StartSection(session.SelectedSectionId, loop.IsChecked == true);
     }
 
-    private void RefreshDocumentTitle() => Title = $"{(ProjectChanged ? "* " : "")}{(projectPath is null ? session.Project.Name : Path.GetFileName(projectPath))} — MidiWorkbench{(BankChanged ? " · Bank unsaved" : "")}";
+    private void RefreshDocumentTitle() => Title = $"{(ProjectChanged ? "* " : "")}{session.Project.Name}{(projectPath is null ? "" : $" ({Path.GetFileName(projectPath)})")} — MidiWorkbench{(BankChanged ? " · Bank unsaved" : "")}";
+
+    private async Task NewSong()
+    {
+        if (session.IsRunning) throw new InvalidOperationException("Stop playback before starting a new song.");
+        // Commit and archive a naturally finished take before checking whether
+        // the current project needs saving. Failure leaves it available to recover.
+        session.Stop(); Reload();
+        var name = await AskName("New song", "Untitled", "Create");
+        if (name is null || !await ConfirmProjectReplacement()) return;
+        session.NewProject(name);
+        savedProject = null; projectPath = null; candidate = null; currentPart = null;
+        loadedOutline = null; loadedGeneratorSettings = null; loadedDrummer = null;
+        var wasLoading = loading; loading = true;
+        try
+        {
+            drummer.SelectedIndex = 1; ShowDrummer(MidiWorkbench.Generation.DrumPersonas.All[0].Id, null);
+            pitch.Value = 60; velocity.Value = 90; tick.Value = 1; duration.Value = .25m; locked.IsChecked = true;
+            snap.SelectedIndex = 2; loop.IsChecked = false;
+        }
+        finally { loading = wasLoading; }
+        playback = "song"; auditionSection = null; replayingTake = null;
+        Reload(); status.Text = $"New song: {session.Project.Name}";
+    }
+
+    private async Task RenameSong()
+    {
+        var name = await AskName("Rename song", session.Project.Name, "Rename");
+        if (name is null || name == session.Project.Name) return;
+        if ((session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing)
+            && await ConfirmSave("Unaccepted preview", "Renaming will discard the current preview. Continue?", null, "Discard preview") != 2) return;
+        session.RenameProject(name); candidate = null; Reload();
+    }
+
+    private async Task RenameSection()
+    {
+        if (session.IsRunning) throw new InvalidOperationException("Stop playback before renaming a section.");
+        var section = session.SelectedSection;
+        var name = await AskName("Rename section", section.Outline.Name, "Rename");
+        if (name is null || name == section.Outline.Name) return;
+        var selectedId = SelectedPart()?.Id;
+        var acceptedSettings = section.Parts.FirstOrDefault(p => p.Id == selectedId)?.Pattern.Recipe?.Settings;
+        var discardGeneratorDraft = generators.HasDraft && !ReferenceEquals(loadedGeneratorSettings, acceptedSettings);
+        var message = discardGeneratorDraft ? "Renaming will discard the preview and its unapplied generator settings. Continue?"
+            : "Renaming will discard the current preview. Continue?";
+        if ((session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing)
+            && await ConfirmSave("Unaccepted preview", message, null, "Discard preview") != 2) return;
+        session.RenameSection(section.Id, name); candidate = null;
+        // Only the name changed: retain unfinished outline controls against the
+        // newly accepted outline. Unchanged generator settings retain their drafts.
+        loadedOutline = session.SelectedSection.Outline;
+        Reload();
+    }
+
+    private async Task NewBank()
+    {
+        var name = await AskName("New bank", "Bank", "Create");
+        if (name is null || !await ConfirmBankReplacement()) return;
+        session.NewBank(name); savedBank = null; RefreshBank(); RefreshDocumentTitle(); status.Text = $"New bank: {session.Bank!.Name}";
+    }
+
+    private async Task RenameBank()
+    {
+        if (session.Bank is not { } bank) throw new InvalidOperationException("Create or load a bank first.");
+        var name = await AskName("Rename bank", bank.Name, "Rename");
+        if (name is null) return;
+        session.RenameBank(name); RefreshBank(); RefreshDocumentTitle();
+    }
+
+    private async Task<string?> AskName(string title, string initial, string confirmLabel)
+    {
+        var dialog = new Window { Title = title, Width = 420, SizeToContent = SizeToContent.Height, CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false };
+        dialog.AddHandler(KeyDownEvent, HandleShortcuts, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        var name = new TextBox { Text = initial };
+        Avalonia.Automation.AutomationProperties.SetName(name, "Name");
+        var error = new TextBlock { Text = "Enter a name.", Foreground = Brushes.Orange, IsVisible = false };
+        var confirm = new Button { Content = confirmLabel, IsDefault = true };
+        var cancel = new Button { Content = "Cancel", IsCancel = true };
+        void Accept()
+        {
+            var value = name.Text?.Trim();
+            if (string.IsNullOrEmpty(value)) { error.IsVisible = true; name.Focus(); return; }
+            dialog.Close(value);
+        }
+        confirm.Click += (_, _) => Accept(); cancel.Click += (_, _) => dialog.Close(null);
+        name.KeyDown += (_, e) => { if (e.Key == Key.Enter && e.KeyModifiers == KeyModifiers.None) { e.Handled = true; Accept(); } };
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right,
+            Children = { cancel, confirm } };
+        dialog.Content = new StackPanel { Margin = new Thickness(20), Spacing = 12,
+            Children = { new TextBlock { Text = "Name" }, name, error, buttons } };
+        dialog.Opened += (_, _) => { name.Focus(); name.SelectAll(); };
+        return await dialog.ShowDialog<string?>(this);
+    }
 
     private void RefreshOutputStatus()
     {
@@ -55,12 +173,11 @@ public sealed partial class MainWindow
         if (saveAs || path is null)
         {
             RequireStoppedForPicker();
-            var file = await StorageProvider.SaveFilePickerAsync(new()
+            path = await PickSaveFile(new()
             {
                 Title = "Save project", SuggestedFileName = path is null ? "song.midiwork.json" : Path.GetFileName(path),
                 FileTypeChoices = [new("MidiWorkbench project") { Patterns = ["*.midiwork.json", "*.json"] }]
             });
-            path = file?.TryGetLocalPath();
             if (path is null) return false;
         }
         session.Save(path); savedProject = session.Project; projectPath = path;
@@ -101,11 +218,42 @@ public sealed partial class MainWindow
         try
         {
             var changed = generatorOnly ? generators.HasDraft : HasUnacceptedChanges();
-            if (changed && await ConfirmSave("Unaccepted changes", "Discard the preview and unapplied settings?", null, "Discard changes") != 2) return;
+            var message = generatorOnly ? "Discard unapplied generator settings?" : "Discard the preview and unapplied settings?";
+            if (changed && await ConfirmSave("Unaccepted changes", message, null, "Discard changes") != 2) return;
             action();
+            if (changed) RestoreDiscardedDrafts(generatorOnly);
         }
         catch (Exception ex) { status.Text = ex.Message; }
         finally { documentDialog = false; }
+    }
+
+    private void RestoreDiscardedDrafts(bool generatorOnly)
+    {
+        if (generatorOnly)
+        {
+            var settings = SelectedPart()?.Pattern.Recipe?.Settings;
+            generators.Load(settings, DisplaySection.Outline.Seed);
+            loadedGeneratorSettings = settings;
+            return;
+        }
+        if (candidate is not null || session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing) ClearCandidate();
+        if (loadedDrummer is { } baseline)
+        {
+            var wasLoading = loading; loading = true;
+            try
+            {
+                drummer.SelectedIndex = baseline.Persona; complexity.Value = baseline.Complexity; fills.Value = baseline.Fills;
+                swing.Value = baseline.Swing; halfTime.IsChecked = baseline.HalfTime;
+            }
+            finally { loading = wasLoading; }
+        }
+        // Reload must repopulate even when an arrangement edit retains the same
+        // immutable outline and recipe instances as before the edit.
+        loadedOutline = null;
+        Reload();
+        var acceptedSettings = SelectedPart()?.Pattern.Recipe?.Settings;
+        generators.Load(acceptedSettings, DisplaySection.Outline.Seed);
+        loadedGeneratorSettings = acceptedSettings;
     }
 
     private async Task<bool> ConfirmBankReplacement()
@@ -139,6 +287,16 @@ public sealed partial class MainWindow
     {
         if (session.IsRunning) throw new InvalidOperationException("Stop playback before opening a file dialog.");
     }
+
+    private async Task<string?> PickOpenFile(FilePickerOpenOptions options)
+    {
+        if (openFilePicker is not null) return await openFilePicker(options);
+        var files = await StorageProvider.OpenFilePickerAsync(options);
+        return files.Count == 1 ? files[0].TryGetLocalPath() : null;
+    }
+
+    private async Task<string?> PickSaveFile(FilePickerSaveOptions options) => saveFilePicker is not null
+        ? await saveFilePicker(options) : (await StorageProvider.SaveFilePickerAsync(options))?.TryGetLocalPath();
 
     private async void OnClosing(object? sender, WindowClosingEventArgs e)
     {
