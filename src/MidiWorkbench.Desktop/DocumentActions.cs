@@ -110,7 +110,7 @@ public sealed partial class MainWindow
     {
         var name = await AskName("New bank", "Bank", "Create");
         if (name is null || !await ConfirmBankReplacement()) return;
-        session.NewBank(name); savedBank = null; RefreshBank(); RefreshDocumentTitle();
+        session.NewBank(name); savedBank = null; RefreshBank(); RefreshDocumentTitle(); status.Text = $"New bank: {session.Bank!.Name}";
     }
 
     private async Task RenameBank()
@@ -173,12 +173,11 @@ public sealed partial class MainWindow
         if (saveAs || path is null)
         {
             RequireStoppedForPicker();
-            var file = await StorageProvider.SaveFilePickerAsync(new()
+            path = await PickSaveFile(new()
             {
                 Title = "Save project", SuggestedFileName = path is null ? "song.midiwork.json" : Path.GetFileName(path),
                 FileTypeChoices = [new("MidiWorkbench project") { Patterns = ["*.midiwork.json", "*.json"] }]
             });
-            path = file?.TryGetLocalPath();
             if (path is null) return false;
         }
         session.Save(path); savedProject = session.Project; projectPath = path;
@@ -288,6 +287,16 @@ public sealed partial class MainWindow
     {
         if (session.IsRunning) throw new InvalidOperationException("Stop playback before opening a file dialog.");
     }
+
+    private async Task<string?> PickOpenFile(FilePickerOpenOptions options)
+    {
+        if (openFilePicker is not null) return await openFilePicker(options);
+        var files = await StorageProvider.OpenFilePickerAsync(options);
+        return files.Count == 1 ? files[0].TryGetLocalPath() : null;
+    }
+
+    private async Task<string?> PickSaveFile(FilePickerSaveOptions options) => saveFilePicker is not null
+        ? await saveFilePicker(options) : (await StorageProvider.SaveFilePickerAsync(options))?.TryGetLocalPath();
 
     private async void OnClosing(object? sender, WindowClosingEventArgs e)
     {

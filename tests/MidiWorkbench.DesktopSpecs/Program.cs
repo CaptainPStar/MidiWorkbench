@@ -9,6 +9,7 @@ using Avalonia.Headless;
 using Avalonia.Input;
 using Avalonia.Input.Raw;
 using Avalonia.Media.Imaging;
+using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
 using MidiWorkbench.Application;
@@ -34,6 +35,26 @@ internal static class Program
             AppBuilder.Configure<WorkbenchApp>().UseSkia()
                 .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).SetupWithoutStarting();
             window = new MainWindow(); window.Show(); Pump();
+            if (args.Contains("--archive-only"))
+            {
+                CheckArchiveRecovery(Field<WorkbenchSession>("session")); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            if (args.Contains("--floating-only"))
+            {
+                CheckFloatingShortcuts(Field<WorkbenchSession>("session")); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            if (args.Contains("--load-feedback-only"))
+            {
+                CheckLoadFeedback(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            if (args.Contains("--pinned-generator-only"))
+            {
+                CheckPinnedGeneratorPreview(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
             if (args.Contains("--export-choice-only"))
             {
                 CheckMidiExportChoice(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
@@ -87,6 +108,12 @@ internal static class Program
                 CheckSectionRename(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
                 SetField("closing", true); window.Close(); Pump(); return 0;
             }
+            CheckLoadFeedback();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckPinnedGeneratorPreview();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
             CheckMidiExportChoice();
             SetField("closing", true); window.Close(); Pump();
             window = new MainWindow(); window.Show(); Pump();
@@ -308,6 +335,123 @@ internal static class Program
         var edited = session.SelectedSection.Parts[0].Pattern.Notes.Single(n => n.Id == "beat-precision-319");
         Check(edited.Tick == 240 && edited.Duration == 240, "Quarter-beat field edits commit 240 ticks");
     }
+    private static void CheckLoadFeedback()
+    {
+        var session = Field<WorkbenchSession>("session");
+        session.StartSection(repeat: true); Thread.Sleep(80); session.Stop();
+        var takePath = Path.Combine(evidence, "feedback-take.json"); session.SaveTake(takePath);
+        session.NewBank("Original"); SetField("savedBank", session.Bank!);
+        var bankPath = Path.Combine(evidence, "feedback-bank.json");
+        ProjectStore.SaveBank(bankPath, session.Bank! with { Name = "Recovered Bank" });
+        var workspace = Field<Control>("workspace"); workspace.GetType().GetMethod("Show")!.Invoke(workspace, ["Perform"]); Pump();
+        var bank = window.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Bank")); bank.IsExpanded = true; Pump();
+        var loadBank = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Load bank"));
+        var loadTake = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Load take"));
+        var saveSelected = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Save selected"));
+        var status = Field<TextBlock>("status"); string? next = takePath;
+        FilePickerOpenOptions? lastOptions = null;
+        SetField("openFilePicker", (Func<FilePickerOpenOptions, Task<string?>>)(options => { lastOptions = options; return Task.FromResult<string?>(next); }));
+        loadBank.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(status.Text == "Unsupported bank schema." && session.Bank!.Name == "Original", "Invalid bank load reports the error and preserves the current bank");
+        next = bankPath; loadBank.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(session.Bank!.Name == "Recovered Bank" && status.Text == "Loaded bank: feedback-bank.json", "Successful bank load replaces the stale error with success");
+        next = null; loadBank.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(session.Bank!.Name == "Recovered Bank" && status.Text == "Loaded bank: feedback-bank.json", "Cancelling the bank picker does not claim a new load");
+        var bankType = (Avalonia.Platform.Storage.FilePickerFileType)typeof(MainWindow).GetField("BankType", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+        Check(bankType.Name == "Bank (JSON)" && lastOptions?.FileTypeFilter?.Single().Name == "Bank (JSON)", "Bank picker uses a bank-specific file type label");
+        next = bankPath;
+        loadTake.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(status.Text != "Loaded bank: feedback-bank.json", "Invalid take load reports an error");
+        next = takePath; loadTake.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(status.Text == "Loaded take: feedback-take.json", "Successful take load replaces the stale error with success");
+        var selectedPath = Path.Combine(evidence, "feedback-selected.json");
+        SetField("saveFilePicker", (Func<FilePickerSaveOptions, Task<string?>>)(_ => Task.FromResult<string?>(selectedPath)));
+        saveSelected.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Until(() => File.Exists(selectedPath));
+        Check(status.Text == "Saved feedback-selected.json", "Saving the selected take reports completion");
+        var savedBankPath = Path.Combine(evidence, "feedback-saved-bank.json"); FilePickerSaveOptions? lastSave = null;
+        SetField("saveFilePicker", (Func<FilePickerSaveOptions, Task<string?>>)(options => { lastSave = options; return Task.FromResult<string?>(savedBankPath); }));
+        var saveBank = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Save bank"));
+        saveBank.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Until(() => File.Exists(savedBankPath));
+        Check(lastSave?.FileTypeChoices?.Single().Name == "Bank (JSON)" && ProjectStore.LoadBank(savedBankPath).Name == "Recovered Bank",
+            "Save bank uses the bank filter and shared save picker");
+        var projectPath = Path.Combine(evidence, "feedback-open-project.midiwork.json");
+        ProjectStore.Save(projectPath, session.Project with { Name = "Loaded project" });
+        next = projectPath;
+        var openProject = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Open") && b.IsEffectivelyVisible && !b.GetVisualAncestors().Contains(bank));
+        openProject.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(session.Project.Name == "Loaded project" && status.Text == "Opened feedback-open-project.midiwork.json" && lastOptions?.Title == "Open project",
+            "Open project uses the shared open picker and reports success");
+        var savedProjectPath = Path.Combine(evidence, "feedback-saved-project.midiwork.json");
+        SetField("saveFilePicker", (Func<FilePickerSaveOptions, Task<string?>>)(options => { lastSave = options; return Task.FromResult<string?>(savedProjectPath); }));
+        Click("Save as"); Until(() => File.Exists(savedProjectPath));
+        Check(lastSave?.Title == "Save project" && ProjectStore.Load(savedProjectPath).Name == "Loaded project", "Save as uses the shared save picker");
+    }
+    private static void CheckPinnedGeneratorPreview()
+    {
+        var session = Field<WorkbenchSession>("session"); var parts = Field<ComboBox>("parts");
+        var generator = Field<Control>("generators"); var type = generator.GetType();
+        T Member<T>(string name) => (T)type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        var preview = Member<Button>("preview"); var pitch = Member<NumericUpDown>("minPitch"); var progression = Member<TextBox>("progression");
+        var section = Field<Button>("prepareSection"); var vary = Field<Button>("varySection"); var cancel = Field<Button>("cancelGeneration");
+        var accept = Field<Button>("accept"); var discard = Field<Button>("discard"); var roll = Field<ScrollViewer>("rollScroll");
+        var expander = window.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Part generator"));
+        bool Fits(Control control)
+        {
+            if (!control.IsEffectivelyVisible) return false;
+            var position = control.TranslatePoint(default, window);
+            return position is { } p && p.X >= 0 && p.Y >= 0 && p.X + control.Bounds.Width <= window.Bounds.Width + 1
+                && p.Y + control.Bounds.Height <= window.Bounds.Height + 1;
+        }
+        void ScrollTo(Control control, ScrollViewer scroller)
+        {
+            var content = (Control)scroller.Content!;
+            var point = control.TranslatePoint(default, content) ?? throw new InvalidOperationException("Generator field detached");
+            scroller.Offset = new Vector(0, Math.Max(0, point.Y - 35)); Pump();
+        }
+        bool WithinScroller(Control control, ScrollViewer scroller)
+        {
+            var point = control.TranslatePoint(default, scroller);
+            return point is { } p && p.Y >= 0 && p.Y + control.Bounds.Height <= scroller.Viewport.Height + 1;
+        }
+        window.Width = 1000; window.Height = 650; Pump();
+        var beforePosition = roll.TranslatePoint(default, window); var beforeSize = roll.Bounds.Size;
+        parts.SelectedItem = parts.ItemsSource!.Cast<object>().Single(item => item.ToString() == "Pad"); Pump();
+        expander.IsExpanded = true; Member<ComboBox>("kind").SelectedItem = GeneratorKind.Chord; Pump();
+        var scroller = generator.GetVisualAncestors().OfType<ScrollViewer>().First();
+        ScrollTo(pitch, scroller);
+        Check(Fits(preview) && Fits(section) && Fits(vary) && WithinScroller(pitch, scroller), "Pinned part and section previews remain reachable at lower pitch settings");
+        Capture("pinned-generator-pitch-1000x650", 1000, 650);
+        ScrollTo(progression, scroller);
+        Check(Fits(preview) && WithinScroller(progression, scroller), "Pinned part preview remains reachable at progression settings");
+        var gate = (SemaphoreSlim)typeof(WorkbenchSession).GetField("generationWorker", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(session)!;
+        gate.Wait();
+        try
+        {
+            preview.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+            ScrollTo(progression, scroller);
+            Check(session.GenerationStatus.Phase == GenerationPhase.Preparing && !preview.IsEnabled && Fits(preview) && Fits(cancel) && Fits(section) && WithinScroller(progression, scroller),
+                "Preparation keeps pinned actions reachable and disables the in-flight part preview");
+            Capture("pinned-generator-preparing-1000x650", 1000, 650);
+            cancel.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        }
+        finally { gate.Release(); }
+        Until(() => preview.IsEnabled && session.GenerationStatus.Phase == GenerationPhase.Cancelled);
+        Click("Preview part"); Until(() => session.Candidate is not null && accept.IsEnabled);
+        ScrollTo(progression, scroller);
+        Check(Fits(preview) && Fits(section) && Fits(vary) && Fits(accept) && Fits(discard) && WithinScroller(progression, scroller), "Candidate-ready actions remain reachable at minimum size");
+        Check(roll.TranslatePoint(default, window) == beforePosition && roll.Bounds.Size == beforeSize, "Pinned generator actions do not shrink the piano-roll viewport");
+        Capture("pinned-generator-ready-1000x650", 1000, 650);
+        window.Width = 1380; window.Height = 900; Pump();
+        expander.IsExpanded = false; Pump();
+        var largerPosition = roll.TranslatePoint(default, window); var largerSize = roll.Bounds.Size;
+        expander.IsExpanded = true; Pump(); ScrollTo(progression, scroller);
+        Check(Fits(preview) && Fits(section) && Fits(vary) && Fits(accept) && Fits(discard), "Candidate-ready pinned actions fit the normal window");
+        Check(roll.TranslatePoint(default, window) == largerPosition && roll.Bounds.Size == largerSize, "Pinned actions keep the normal-size piano-roll viewport unchanged");
+        Capture("pinned-generator-ready-1380x900", 1380, 900);
+        Check(window.GetVisualDescendants().OfType<Button>().Count(b => Equals(b.Content, "Preview part") && b.IsEffectivelyVisible) == 1,
+            "Only one Preview part action is visible");
+        expander.IsExpanded = false; Pump(); Check(!preview.IsVisible && Fits(section) && Fits(vary), "Collapsing the generator hides its scoped action but keeps section actions");
+    }
     private static IReadOnlyList<(long Tick, int Channel, int Pitch, int Velocity)> ReadMidiAttacks(string path)
     {
         var bytes = File.ReadAllBytes(path); var position = 0;
@@ -350,7 +494,7 @@ internal static class Program
         typeof(WorkbenchSession).GetMethod("Apply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(session, [project]);
         session.SetRig(new Rig(Rig.CurrentSchemaVersion, [new("offline-device", false, 35)], [new("Lead", "offline-device", 7)])); Invoke("Reload"); Pump();
         var baseline = session.Project; var rig = session.Rig; var output = "";
-        SetField("midiExportPicker", (Func<string, Task<string?>>)(_ => Task.FromResult<string?>(output)));
+        SetField("saveFilePicker", (Func<FilePickerSaveOptions, Task<string?>>)(_ => Task.FromResult<string?>(output)));
         void Open() { Click("Export MIDI"); Pump(); }
         Window Dialog() => window.OwnedWindows.Single(w => w.Title == "Export MIDI");
         ComboBox NamedCombo(Window dialog, string name) => dialog.GetVisualDescendants().OfType<ComboBox>().Single(c => AutomationProperties.GetName(c) == name);
@@ -374,7 +518,7 @@ internal static class Program
         ExportAndCheck("song-routing.mid", 0, 0, 7, 2); ExportAndCheck("song-stored.mid", 0, 1, 2, 2);
         ExportAndCheck("section-routing.mid", 1, 0, 7, 1); ExportAndCheck("section-stored.mid", 1, 1, 2, 1);
         Check(ReferenceEquals(session.Project, baseline) && ReferenceEquals(session.Rig, rig), "Export choices do not change the project or rig");
-        typeof(MainWindow).GetField("midiExportPicker", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, null);
+        typeof(MainWindow).GetField("saveFilePicker", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, null);
         // Rig settings persist between windows; do not leak this offline fixture
         // into subsequent tests that launch the ordinary four-part project.
         session.SetRig(originalRig);
@@ -1079,7 +1223,7 @@ internal static class Program
         Activate("New bank");
         using (var frame = Dialog("New bank").CaptureRenderedFrame()) frame!.Save(Path.Combine(evidence, "new-bank-dialog.png"), PngBitmapEncoderOptions.Default);
         SetNameAndEnter("New bank", "Festival");
-        Check(session.Bank?.Name == "Festival" && Field<TextBlock>("bankName").Text == "Festival", "Creating a bank uses the requested name");
+        Check(session.Bank?.Name == "Festival" && Field<TextBlock>("bankName").Text == "Festival" && Field<TextBlock>("status").Text == "New bank: Festival", "Creating a bank uses the requested name and reports success");
         Activate("Add current");
         var sectionScale = Field<TextBox>("scale"); var originalScale = sectionScale.Text; sectionScale.Text = "0,2,3,5,7,8,10";
         Click("Rename song"); SetNameAndEnter("Rename song", "Second Song");
@@ -1205,6 +1349,31 @@ internal static class Program
         var sections = Field<ComboBox>("sections");
         var floating = TopLevel.GetTopLevel(sections) as Window;
         Check(floating is not null && floating != window, "Outline actually floats into another window");
+        var expander = floating!.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Part generator"));
+        expander.IsExpanded = true; Pump();
+        var pendingPicker = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        SetField("openFilePicker", (Func<FilePickerOpenOptions, Task<string?>>)(_ => pendingPicker.Task));
+        var open = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Open") && b.IsEffectivelyVisible);
+        open.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        var beforeGeneration = session.GenerationStatus;
+        var partPreview = (Button)Field<Control>("generators").GetType().GetField("preview", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(Field<Control>("generators"))!;
+        partPreview.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(session.Candidate is null && session.GenerationStatus == beforeGeneration, "A suspended file picker blocks Preview part in a floating pane");
+        Invoke("StartSong"); Until(() => session.IsRunning); sections.Focus();
+        floating!.KeyPress(Key.F8, RawInputModifiers.None, PhysicalKey.None, null);
+        floating!.KeyRelease(Key.F8, RawInputModifiers.None, PhysicalKey.None, null); Until(() => !session.IsRunning);
+        Check(!session.IsRunning, "F8 remains available during a suspended file picker");
+        Invoke("StartSong"); Until(() => session.IsRunning);
+        floating!.KeyPress(Key.Space, RawInputModifiers.Control | RawInputModifiers.Shift, PhysicalKey.None, null);
+        floating!.KeyRelease(Key.Space, RawInputModifiers.Control | RawInputModifiers.Shift, PhysicalKey.None, null); Until(() => !session.IsRunning);
+        Check(!session.IsRunning, "Panic remains available during a suspended file picker");
+        pendingPicker.SetResult(null); Until(() => !Field<bool>("documentDialog"));
+        SetField("openFilePicker", (Func<FilePickerOpenOptions, Task<string?>>)(_ => Task.FromException<string?>(new IOException("Picker failed"))));
+        open.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(Field<TextBlock>("status").Text == "Picker failed" && !Field<bool>("documentDialog"), "Picker errors report failure and release the dialog gate");
+        typeof(MainWindow).GetField("openFilePicker", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, null);
+        Check(session.Candidate is null, "Cancelling the suspended picker leaves generation unchanged");
+        expander.IsExpanded = false; Pump();
         sections.Focus();
         Invoke("StartSong"); Until(() => session.Status().Running);
         floating!.KeyPress(Key.F8, RawInputModifiers.None, PhysicalKey.None, null);
@@ -1264,7 +1433,7 @@ internal static class Program
             Click("Stop"); Pump();
             Check(!session.IsRunning && Field<TextBlock>("status").Text!.Contains("Take archive failed"), "Archive failure is visible after stop");
             Check(FindButton(window, "Save take").IsEffectivelyEnabled, "Archive failure leaves Save take enabled");
-            SetField("takeSavePicker", (Func<Task<string?>>)(() => Task.FromResult<string?>(recoveryPath)));
+            SetField("saveFilePicker", (Func<FilePickerSaveOptions, Task<string?>>)(_ => Task.FromResult<string?>(recoveryPath)));
             Click("Save take"); Until(() => File.Exists(recoveryPath));
             Check(ProjectStore.LoadTake(recoveryPath).Complete, "Save take action writes recovery JSON outside the failed archive");
             Invoke("StartSong"); Until(() => session.IsRunning);
@@ -1272,7 +1441,7 @@ internal static class Program
         }
         finally
         {
-            typeof(MainWindow).GetField("takeSavePicker", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, null);
+            typeof(MainWindow).GetField("saveFilePicker", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, null);
             File.Delete(directory); Directory.Move(held, directory);
             if (session.IsRunning) session.Stop();
             Pump();

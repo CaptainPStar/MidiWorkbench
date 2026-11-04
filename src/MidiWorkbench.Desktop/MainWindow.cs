@@ -55,8 +55,8 @@ public sealed partial class MainWindow : Window
     private readonly NumericUpDown pitch = Number(0, 127, 60), velocity = Number(1, 127, 90), tick = Number(1, 1000001, 1), duration = Number(1m / MusicalTime.Ppq, 1000000, .25m);
     private readonly List<Control> stoppedControls = new();
     private readonly HashSet<Control> pendingButtons = new();
-    private Func<Task<string?>>? takeSavePicker = null;
-    private Func<string, Task<string?>>? midiExportPicker = null;
+    private Func<FilePickerOpenOptions, Task<string?>>? openFilePicker = null;
+    private Func<FilePickerSaveOptions, Task<string?>>? saveFilePicker = null;
     private readonly List<Control> noteEditControls = new();
     private readonly Button play, playSection, undo, redo, accept, discard, audition, returnAudition, cancelGeneration, prepareSection, varySection, cancelQueued;
     private readonly ComboBox candidateBoundary = new() { ItemsSource = new[] { "Bar", "Beat" }, SelectedIndex = 0 };
@@ -132,17 +132,22 @@ public sealed partial class MainWindow : Window
         Tip(candidateBoundary, "Boundary for live audition, return or acceptance");
         AutomationProperties.SetName(candidateBoundary, "Candidate boundary");
         Tip(accept, "Commit the candidate. During playback, queue it at the chosen boundary. Cancelling a queued launch does not undo the accepted edit.");
+        var partGenerator = new Expander { Header = "Part generator", Content = generators };
+        var previewPart = generators.PreviewButton;
+        previewPart.IsVisible = partGenerator.IsExpanded;
+        Tip(previewPart, "Preview the selected part using these generator settings");
+        partGenerator.PropertyChanged += (_, e) => { if (e.Property == Expander.IsExpandedProperty) previewPart.IsVisible = partGenerator.IsExpanded; };
         var outlineSettings = Column(Label("Sections", sections), sectionTools,
             new Expander { Header = "Section settings", IsExpanded = true, Content = Column(new TextBlock { Text = "Apply changes with Preview section, then Accept.", TextWrapping = Avalonia.Media.TextWrapping.Wrap },
                 Wrap(Label("Bars", bars), Label("Meter", Wrap(numerator, denominator))),
                 Wrap(PitchLabel("Root note", root), Label("Seed", seed)), Label("Scale intervals", scale),
                 AmountLabel("Density", density), AmountLabel("Intensity", intensity), AmountLabel("Variation", variation)) },
             new Expander { Header = "Drummer", Content = Column(Label("Persona", drummer), Label("Complexity", complexity), Label("Fills", fills), Label("Swing", swing), halfTime) },
-            new Expander { Header = "Part generator", Content = generators });
+            partGenerator);
         var outline = new Grid { RowDefinitions = new RowDefinitions("*,Auto") };
         outline.Children.Add(new ScrollViewer { Content = outlineSettings });
         candidateTools = Wrap(candidateBoundary, audition, returnAudition, accept, discard);
-        var candidateActions = Column(Wrap(prepareSection, varySection, cancelGeneration), candidateLabel, candidateTools);
+        var candidateActions = Column(Wrap(prepareSection, varySection, previewPart, cancelGeneration), candidateLabel, candidateTools);
         Grid.SetRow(candidateActions, 1); outline.Children.Add(candidateActions);
         Tip(scale, "Pitch-class intervals from the root, separated by commas");
         generators.Error += ex => status.Text = ex.Message;
@@ -329,6 +334,7 @@ public sealed partial class MainWindow : Window
     }
     private async Task PrepareAsync(Func<Task<Section>> prepare)
     {
+        if (documentDialog || closePending) return;
         try
         {
             var pending = prepare(); candidate = session.Candidate; RefreshNotes(); UpdateCandidate();
@@ -585,8 +591,8 @@ public sealed partial class MainWindow : Window
     private async Task Open()
     {
         RequireStoppedForPicker();
-        var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Open project", AllowMultiple = false });
-        if (files.Count == 1 && files[0].TryGetLocalPath() is { } path && await ConfirmProjectReplacement())
+        var path = await PickOpenFile(new() { Title = "Open project", AllowMultiple = false });
+        if (path is not null && await ConfirmProjectReplacement())
         { session.Load(path); savedProject = session.Project; projectPath = path; candidate = null; currentPart = null; Reload(); status.Text = $"Opened {Path.GetFileName(path)}"; }
     }
     private async Task Save()
@@ -595,28 +601,28 @@ public sealed partial class MainWindow : Window
     }
     private async Task SaveAs() { await SaveProject(true); }
     private static readonly FilePickerFileType JsonType = new("Take (JSON)") { Patterns = ["*.json"] };
+    private static readonly FilePickerFileType BankType = new("Bank (JSON)") { Patterns = ["*.json"] };
     private static readonly FilePickerFileType MidiType = new("Standard MIDI file") { Patterns = ["*.mid"] };
     private async Task LoadTake()
     {
         RequireStoppedForPicker();
-        var folder = session.TakeDirectory is { } directory && Directory.Exists(directory) ? await StorageProvider.TryGetFolderFromPathAsync(directory) : null;
-        var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Load take", AllowMultiple = false, FileTypeFilter = [JsonType], SuggestedStartLocation = folder });
-        if (files.Count == 1 && files[0].TryGetLocalPath() is { } path) RefreshTakes(session.LoadTake(path));
+        var folder = openFilePicker is null && session.TakeDirectory is { } directory && Directory.Exists(directory)
+            ? await StorageProvider.TryGetFolderFromPathAsync(directory) : null;
+        var path = await PickOpenFile(new() { Title = "Load take", AllowMultiple = false, FileTypeFilter = [JsonType], SuggestedStartLocation = folder });
+        if (path is not null) { RefreshTakes(session.LoadTake(path)); status.Text = $"Loaded take: {Path.GetFileName(path)}"; }
     }
     private async Task SaveTake()
     {
         RequireStoppedForPicker();
-        var path = takeSavePicker is null
-            ? (await StorageProvider.SaveFilePickerAsync(new() { Title = "Save take", SuggestedFileName = "take.json", FileTypeChoices = [JsonType, MidiType] }))?.TryGetLocalPath()
-            : await takeSavePicker();
+        var path = await PickSaveFile(new() { Title = "Save take", SuggestedFileName = "take.json", FileTypeChoices = [JsonType, MidiType] });
         if (path is not null) { session.SaveTake(path); status.Text = $"Saved {Path.GetFileName(path)}"; }
     }
     private async Task SaveSelectedTake()
     {
         RequireStoppedForPicker();
         var take = SelectedTake();
-        var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Save selected take", SuggestedFileName = "take.json", FileTypeChoices = [JsonType, MidiType] });
-        if (file?.TryGetLocalPath() is { } path) session.SaveTake(path, take);
+        var path = await PickSaveFile(new() { Title = "Save selected take", SuggestedFileName = "take.json", FileTypeChoices = [JsonType, MidiType] });
+        if (path is not null) { session.SaveTake(path, take); status.Text = $"Saved {Path.GetFileName(path)}"; }
     }
     private PerformanceTake SelectedTake() => takes.SelectedIndex >= 0 && takes.SelectedIndex < takeItems.Length
         ? takeItems[takes.SelectedIndex] : throw new InvalidOperationException("Choose a take first.");
@@ -627,9 +633,7 @@ public sealed partial class MainWindow : Window
         if (options is null) return;
         RequireStoppedForPicker();
         var suggested = options.SongOrder ? "song.mid" : "section.mid";
-        var path = midiExportPicker is null
-            ? (await StorageProvider.SaveFilePickerAsync(new() { Title = "Export MIDI", SuggestedFileName = suggested, FileTypeChoices = [MidiType] }))?.TryGetLocalPath()
-            : await midiExportPicker(suggested);
+        var path = await PickSaveFile(new() { Title = "Export MIDI", SuggestedFileName = suggested, FileTypeChoices = [MidiType] });
         if (path is null) return;
         var channels = options.CurrentRouting ? ExportChannelMode.RoutingOverrides : ExportChannelMode.ProjectChannels;
         if (options.SongOrder) session.ExportArrangementMidi(path, channels); else session.ExportMidi(path, channels);
@@ -642,7 +646,7 @@ public sealed partial class MainWindow : Window
         var pane = Column(Label("Bank", bankName), Wrap(AsyncButton("New bank", NewBank, true, true), AsyncButton("Rename bank", RenameBank, true, true),
             AsyncButton("Load bank", LoadBank, true, true), AsyncButton("Save bank", SaveBank, true, true)),
             Label("Song", bankSongs), Wrap(Button("Add current", () => { session.AddCurrentToBank(); RefreshBank(); }, true),
-                AsyncButton("Open", async () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id && await ConfirmProjectReplacement()) { session.OpenBankSong(id); savedProject = session.Project; projectPath = null; candidate = null; currentPart = null; Reload(); } }, true, true),
+                AsyncButton("Open", async () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id && await ConfirmProjectReplacement()) { session.OpenBankSong(id); savedProject = session.Project; projectPath = null; candidate = null; currentPart = null; Reload(); status.Text = $"Opened {session.Project.Name}"; } }, true, true),
                 Button("Update", () => { if ((bankSongs.SelectedItem as Choice)?.Id is { } id) { session.UpdateBankSong(id); RefreshBank(); } }, true)),
             Label("Set order", bankOrder), Wrap(Button("Append", () => { if (session.Bank is { } bank && (bankSongs.SelectedItem as Choice)?.Id is { } id) { session.SetBankOrder(bank.Order.Add(id)); RefreshBank(); } }, true),
                 Button("Remove", () => { if (session.Bank is { } bank && bankOrder.SelectedIndex >= 0) { session.SetBankOrder(bank.Order.RemoveAt(bankOrder.SelectedIndex)); RefreshBank(); } }, true),
@@ -671,13 +675,13 @@ public sealed partial class MainWindow : Window
     private async Task LoadBank()
     {
         RequireStoppedForPicker();
-        var files = await StorageProvider.OpenFilePickerAsync(new() { Title = "Load bank", AllowMultiple = false, FileTypeFilter = [JsonType] });
-        if (files.Count == 1 && files[0].TryGetLocalPath() is { } path && await ConfirmBankReplacement()) { session.LoadBank(path); savedBank = session.Bank; RefreshBank(); }
+        var path = await PickOpenFile(new() { Title = "Load bank", AllowMultiple = false, FileTypeFilter = [BankType] });
+        if (path is not null && await ConfirmBankReplacement()) { session.LoadBank(path); savedBank = session.Bank; RefreshBank(); status.Text = $"Loaded bank: {Path.GetFileName(path)}"; }
     }
     private async Task SaveBank()
     {
         RequireStoppedForPicker();
-        var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Save bank", SuggestedFileName = "bank.json", FileTypeChoices = [JsonType] });
-        if (file?.TryGetLocalPath() is { } path) { session.SaveBank(path); savedBank = session.Bank; status.Text = $"Saved {Path.GetFileName(path)}"; }
+        var path = await PickSaveFile(new() { Title = "Save bank", SuggestedFileName = "bank.json", FileTypeChoices = [BankType] });
+        if (path is not null) { session.SaveBank(path); savedBank = session.Bank; status.Text = $"Saved {Path.GetFileName(path)}"; }
     }
 }

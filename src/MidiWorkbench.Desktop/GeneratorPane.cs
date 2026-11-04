@@ -37,12 +37,13 @@ internal sealed class GeneratorPane : StackPanel
     private decimal loadedSeed = 1;
     private bool loading;
     public Func<GeneratorSettings, Task>? Prepare { get; set; }
+    public Button PreviewButton => preview;
     public bool IsPreparing { set => preview.IsEnabled = !value; }
     public event Action<Exception>? Error;
     public GeneratorPane()
     {
         Spacing = 8;
-        Add("Generator", kind); Children.Add(preview); Children.Add(densityContext);
+        Add("Generator", kind); Children.Add(densityContext);
         ToolTip.SetTip(densityContext, "Uses the accepted section density. Preview section and Accept apply outline edits. Step masks, local probability and per-step probabilities also affect results.");
         AutomationProperties.SetName(densityContext, "Accepted section density");
         Add("Seed", seed); Add("Steps", steps); Add("Step length", stepLength); Add("Quarter-note beats", stepBeats);
