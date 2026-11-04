@@ -47,10 +47,10 @@ Or `bash scripts/publish.sh win-x64`. Output is under `artifacts/win-x64/`. Run 
 ## First session
 
 1. The output bar identifies simulation, missing routes and MIDI outputs. Simulation sends no MIDI to instruments. Open Routing, assign each destination an output and channel, choose the input, enable Clock where wanted, then Apply routing.
-2. Outline: set meter, root, scale and musical amounts. Preview a section or a part generator. Audition, then Accept or Discard.
+2. Outline: set meter, root, scale and musical amounts. Preview a section or a part generator. Choose its step length as a note value, triplet, dotted note or custom quarter-note beats. Audition, then Accept or Discard.
 3. Patterns: click empty space to add a note; drag it to move, or drag its right edge to resize. Right-click/Delete removes. Start beat is counted from 1; length is in quarter-note beats (0.25 = a sixteenth note), independent of meter. Pitch shows the note name and MIDI number. Locked notes survive regeneration. Pattern kind explicitly controls Fixed/Hybrid/Generative behavior.
-4. Perform: arm a part or New part, then play the section. Stop commits keyboard notes. Arm changes require stopped playback.
-5. Arrange sections with repeats or queue a section at a beat/bar boundary. Song banks hold reusable project snapshots and setlist order.
+4. Perform: arm a part or New part, then use Record section. Both start actions record while a target is armed. Stop keeps the keyboard notes. Arm changes require stopped playback.
+5. Arrange sections with repeats or queue a section at a beat/bar boundary. The playback status names the sounding section independently of the editor selection, and identifies previews, take replay and recording. Song banks hold reusable project snapshots and setlist order.
 6. Save the project, export the song as MIDI, or recall a captured take. A DAW or MusicSessionTrace can capture the performance; built-in recording remains available for phrase development.
 
 See [live generation and editing](docs/live-generation.md) for audition, variation, cancellation and keyboard controls.

@@ -34,6 +34,10 @@ internal static class Program
             AppBuilder.Configure<WorkbenchApp>().UseSkia()
                 .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).SetupWithoutStarting();
             window = new MainWindow(); window.Show(); Pump();
+            CheckPlaybackIdentity();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckGeneratorTiming();
+            window = new MainWindow(); window.Show(); Pump();
             var session = Field<WorkbenchSession>("session");
             Check(!window.Title!.StartsWith('*'), "Initial project is clean");
             Check(Field<TextBlock>("outputStatus").Text!.Contains("Simulation"), "Simulation routing is explicit");
@@ -215,6 +219,126 @@ internal static class Program
         Click("Apply");
         var edited = session.SelectedSection.Parts[0].Pattern.Notes.Single(n => n.Id == "beat-precision-319");
         Check(edited.Tick == 240 && edited.Duration == 240, "Quarter-beat field edits commit 240 ticks");
+    }
+    private static void CheckPlaybackIdentity()
+    {
+            var session = Field<WorkbenchSession>("session");
+            var initial = session.Project;
+            var first = new MidiWorkbench.Generation.SectionGenerator().Generate(initial.Sections[0].Outline with { Name = "Verse", Bars = 1 });
+            var second = first with { Id = "status-chorus", Outline = first.Outline with { Name = "Chorus" } };
+            var project = initial with { Bpm = 400, Sections = [first, second], Arrangement = [new(first.Id), new(second.Id)] };
+            typeof(WorkbenchSession).GetMethod("Apply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(session, [project]);
+            session.SelectSection(second.Id); Invoke("Reload"); SetField("savedProject", session.Project);
+            var label = Field<TextBlock>("performanceStatus");
+            Field<CheckBox>("loop").IsChecked = true;
+            Invoke("StartSong"); Until(() => session.IsRunning);
+            Check(label.Text == "Playing: Verse" && label.IsVisible, "Song shows the sounding arrangement section rather than the editor selection");
+            session.Stop(); Invoke("Reload"); Pump();
+            Invoke("PlaySection"); Until(() => session.IsRunning);
+            Check(label.Text == "Playing: Chorus", "Section playback identifies its sounding section");
+            Field<ComboBox>("launchSection").SelectedIndex = 0;
+            Field<ComboBox>("launchBoundary").SelectedIndex = 1;
+            Invoke("QueueSection");
+            Until(() => session.PlayingSectionId == first.Id);
+            Check(session.SelectedSectionId == second.Id && label.Text == "Playing: Verse", "Queued launch keeps selected Chorus separate from sounding Verse");
+            Capture("playing-1000x650", 1000, 650); Capture("playing-1380x900", 1380, 900);
+            session.Stop(); Invoke("Reload"); Pump();
+            Check(!label.IsVisible, "Stopped transport clears the sounding label");
+
+            Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+            Until(() => session.Candidate is not null || session.GenerationStatus.Phase == GenerationPhase.Failed);
+            if (session.Candidate is null) throw new InvalidOperationException($"Preview failed: {session.GenerationStatus.Error}; {Field<TextBlock>("status").Text}");
+            Click("Audition"); Until(() => session.IsRunning);
+            Check(label.Text == "Playing preview: Chorus", "Preview playback is identified as a preview");
+            Thread.Sleep(200); session.Stop(); Invoke("Reload"); Pump(); Click("Discard");
+            var recorded = session.Takes.Last();
+            SetField("playback", "take"); SetField("replayingTake", recorded); session.PlayTake(recorded);
+            Until(() => session.IsRunning);
+            Check(label.Text == "Playing: take", "Take replay is not mislabeled as the selected section");
+            session.Stop(); Invoke("Reload"); Pump();
+
+            var selected = session.SelectedSection;
+            var longSection = selected with { Outline = selected.Outline with { Name = "Chorus with a deliberately very long section name for a live performance" } };
+            typeof(WorkbenchSession).GetMethod("Apply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(session,
+                [session.Project with { Sections = session.Project.Sections.Replace(selected, longSection) }]);
+            session.SetRig(session.Rig with { Input = "loopback" }); session.Arm(WorkbenchSession.NewPhrase); Invoke("Reload"); Pump();
+            Check(Equals(Field<Button>("play").Content, "Record section") && Equals(Field<Button>("playSection").Content, "Record section"),
+                "Both play actions identify armed recording");
+            Invoke("PlaySection"); Until(() => session.IsRunning);
+            Check(label.Text!.StartsWith("Recording: New part · Playing: Chorus with a deliberately", StringComparison.Ordinal),
+                "Running recording prioritizes its target even with a long sounding section name");
+            Capture("recording-1000x650", 1000, 650); Capture("recording-1380x900", 1380, 900);
+            session.Stop(); session.Arm(null); Invoke("Reload"); Pump();
+            Check(!label.IsVisible && Equals(Field<Button>("play").Content, "Play song") && Equals(Field<Button>("playSection").Content, "Play section"),
+                "Stopping and disarming restore play labels");
+            SetField("savedProject", session.Project); window.Close(); Pump();
+    }
+    private static void CheckGeneratorTiming()
+    {
+        var session = Field<WorkbenchSession>("session");
+        var generator = Field<Control>("generators"); var type = generator.GetType();
+        T Member<T>(string name) => (T)type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        var load = type.GetMethod("Load")!; var read = type.GetMethod("Read", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var length = Member<ComboBox>("stepLength"); var beats = Member<NumericUpDown>("stepBeats");
+        var kind = Member<ComboBox>("kind"); var source = Member<CheckBox>("source");
+        var rows = Member<Dictionary<Control, Control>>("fields");
+        bool Dirty() => (bool)type.GetProperty("HasDraft")!.GetValue(generator)!;
+        GeneratorSettings Read() => (GeneratorSettings)read.Invoke(generator, null)!;
+        void Select(string value) => length.SelectedItem = length.ItemsSource!.Cast<object>().Single(item => item.ToString() == value);
+        void Load(GeneratorSettings settings) => load.Invoke(generator, [settings, 123u]);
+        var settings = new GeneratorSettings(GeneratorKind.StepSequencer)
+        {
+            Seed = null, PartSeed = 37, Steps = 4, StepTicks = 73,
+            StepVelocities = [80, 81, 82, 83], StepProbabilities = [.1, .2, .3, .4], StepRatchets = [1, 2, 3, 4],
+            EnabledSteps = [true, false, true, false], ChordDegrees = [1, 3, 5], Progression = [2, 4]
+        };
+        Load(settings);
+        Check(length.SelectedItem!.ToString() == "Custom" && Read().StepTicks == 73 && !Dirty(), "Custom 73-tick timing loads and round-trips without a false draft");
+        var preserved = Read();
+        Check(preserved.Seed is null && preserved.PartSeed == 37 && preserved.ChordDegrees.SequenceEqual(settings.ChordDegrees)
+            && preserved.Progression.SequenceEqual(settings.Progression) && preserved.StepVelocities.SequenceEqual(settings.StepVelocities),
+            "Unchanged generator preserves hidden fields, nullable seed and step controls");
+        var shortSequence = settings with { Steps = 1, Pulses = 5, Rotation = 7 };
+        Load(shortSequence); var shortRead = Read();
+        Check(!Dirty() && shortRead.Pulses == 5 && shortRead.Rotation == 7, "Unchanged non-Euclidean recipe preserves hidden rhythm values");
+        kind.SelectedItem = GeneratorKind.Euclidean; var euclidean = Read();
+        Check(euclidean.Pulses <= euclidean.Steps && euclidean.Rotation < euclidean.Steps, "Switching to Euclidean uses bounded visible rhythm values");
+        Load(settings);
+        Select("1/8"); Check(Read().StepTicks == 480 && Dirty(), "Eighth-note timing maps to 480 ticks and marks a draft");
+        Select("1/8 triplet"); Check(Read().StepTicks == 320, "Eighth-note triplet maps to 320 ticks");
+        Select("1/8 dotted"); Check(Read().StepTicks == 720, "Dotted eighth note maps to 720 ticks");
+        Select("Custom"); beats.Value = 8m / MusicalTime.Ppq; Check(Read().StepTicks == 8, "Custom timing supports the minimum eight ticks");
+        beats.Value = 128; Check(Read().StepTicks == 122880, "Custom timing supports the maximum 128 quarter notes");
+        Load(settings); Member<NumericUpDown>("steps").Value = 2;
+        var shortened = Read();
+        Check(shortened.StepVelocities.Length == 2 && shortened.StepProbabilities.Length == 2 && shortened.StepRatchets.Length == 2 && shortened.EnabledSteps.Length == 2
+            && settings.StepVelocities.Length == 4, "Shorter sequence trims candidate step arrays without changing the loaded recipe");
+        Load(settings); kind.SelectedItem = GeneratorKind.Pad;
+        Check(!rows[length].IsVisible && !rows[beats].IsVisible, "Pad hides step-length controls");
+        var note = new MidiNote("source", 0, 120, 60, 90);
+        var arp = new GeneratorSettings(GeneratorKind.Arpeggiator) { StepDegrees = [7, 5], SourceNotes = [note], SourceLengthTicks = 960 };
+        Load(arp);
+        Check(!Dirty() && Read().StepDegrees.SequenceEqual(arp.StepDegrees) && Read().SourceNotes.Length == 1, "Arpeggiator round-trip preserves hidden degrees and source material");
+        source.IsChecked = false;
+        Check(Read().SourceNotes.IsEmpty && Read().SourceLengthTicks is null, "Disabling source removes stored source material");
+        source.IsChecked = true; kind.SelectedItem = GeneratorKind.StepSequencer;
+        Check(Read().SourceNotes.IsEmpty && Read().SourceLengthTicks is null, "Non-arpeggiator generators do not retain source material");
+
+        var sectionSettings = window.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Section settings"));
+        var generatorExpander = window.GetVisualDescendants().OfType<Expander>().Single(e => Equals(e.Header, "Part generator"));
+        sectionSettings.IsExpanded = false; generatorExpander.IsExpanded = true; Pump();
+        Load(settings); Pump();
+        generator.GetVisualAncestors().OfType<ScrollViewer>().First().Offset = new Vector(0, 320); Pump();
+        Capture("generator-custom-1380x900", 1380, 900);
+        Select("1/8"); length.BringIntoView(); Pump(); Capture("generator-eighth-1380x900", 1380, 900);
+        var preview = Member<Button>("preview"); preview.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null || session.GenerationStatus.Phase == GenerationPhase.Failed);
+        var candidate = session.Candidate ?? throw new InvalidOperationException($"Part preview failed: {session.GenerationStatus.Error}; {Field<TextBlock>("status").Text}");
+        var selectedId = session.SelectedSection.Parts[0].Id;
+        Check(candidate.Parts.Single(p => p.Id == selectedId).Pattern.Recipe?.Settings?.StepTicks == 480, "Preview part uses the selected musical step length");
+        Field<Button>("accept").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(session.SelectedSection.Parts.Single(p => p.Id == selectedId).Pattern.Recipe?.Settings?.StepTicks == 480, "Accept stores the selected step length in the recipe");
+        SetField("savedProject", session.Project); window.Close(); Pump();
     }
     private static void CheckOutlineDraftProtection(WorkbenchSession session)
     {

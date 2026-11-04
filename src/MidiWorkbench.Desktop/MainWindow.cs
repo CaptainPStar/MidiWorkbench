@@ -29,6 +29,7 @@ public sealed partial class MainWindow : Window
     private readonly BeatPulse pulse = new() { Width = 220 };
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(50) };
     private readonly TextBlock selectedCount = new(), queuedStatus = new();
+    private readonly TextBlock performanceStatus = new() { MaxWidth = 360, TextTrimming = Avalonia.Media.TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center, IsVisible = false };
     private readonly TextBlock takeHistoryHint = new() { Text = "Recent takes; Load take opens older recordings.", IsVisible = false, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly TextBlock status = new(), beat = new() { FontSize = 20, MinWidth = 120 }, activity = new(), candidateLabel = new();
     private readonly TextBox sectionName = new(), scale = new();
@@ -56,7 +57,7 @@ public sealed partial class MainWindow : Window
     private readonly HashSet<Control> pendingButtons = new();
     private Func<Task<string?>>? takeSavePicker = null;
     private readonly List<Control> noteEditControls = new();
-    private readonly Button play, undo, redo, accept, discard, audition, returnAudition, cancelGeneration, prepareSection, varySection, cancelQueued;
+    private readonly Button play, playSection, undo, redo, accept, discard, audition, returnAudition, cancelGeneration, prepareSection, varySection, cancelQueued;
     private readonly ComboBox candidateBoundary = new() { ItemsSource = new[] { "Bar", "Beat" }, SelectedIndex = 0 };
     private readonly Control candidateTools;
     private readonly string layout = Path.Combine(Settings, "layout.json");
@@ -190,15 +191,16 @@ public sealed partial class MainWindow : Window
         AutomationProperties.SetName(notes, "Note list");
 
         record.SelectionChanged += (_, _) => { if (!loading) Try(() => { try { session.Arm((record.SelectedItem as Choice)?.Id); } finally { Reload(); } }); };
-        Tip(record, "Arms the routing input with MIDI thru. Recording plays and loops the selected section; Stop commits locked notes.");
+        Tip(record, "Arms the routing input with MIDI thru. Recording plays the selected section; Loop repeats it. Stop keeps recorded notes.");
         var takeTools = Wrap(AsyncButton("Load take", LoadTake, true, true), AsyncButton("Save selected", SaveSelectedTake, true, true), Button("Recall last", () => { session.Stop(); var take = session.Take(); RefreshTakes(take); }, true),
             Button("Replay", () => { if (takes.SelectedIndex < 0 || takes.SelectedIndex >= takeItems.Length) throw new InvalidOperationException("Choose a take first."); playback = "take"; replayingTake = takeItems[takes.SelectedIndex]; session.PlayTake(replayingTake); }, true));
+        playSection = Button("Play section", PlaySection, true);
         stoppedControls.Add(record); stoppedControls.Add(arrangement);
         workspace = new(new()
         {
             ["Outline"] = outline, ["Patterns"] = editor,
             ["Perform"] = new ScrollViewer { Content = Column(activity, Label("Record into", record),
-                Button("Play section", PlaySection, true), Wrap(launchSection, launchBoundary, Button("Queue", QueueSection)),
+                playSection, Wrap(launchSection, launchBoundary, Button("Queue", QueueSection)),
                 arrangement, Label("Takes", takes), takeHistoryHint, takeTools, new Expander { Header = "Bank", Content = BuildBankPane() }) }, ["Routing"] = routing
         });
         workspace.AttachShortcuts(HandleShortcuts);
@@ -211,7 +213,8 @@ public sealed partial class MainWindow : Window
         transport.Margin = new Thickness(12, 10, 4, 0); files.Margin = new Thickness(12, 0, 4, 0);
         body.Children.Add(transport);
         Grid.SetRow(files, 1); body.Children.Add(files);
-        var outputBar = Wrap(outputStatus, Button("Routing", () => workspace.Show("Routing")));
+        AutomationProperties.SetName(performanceStatus, "Playback status");
+        var outputBar = Wrap(outputStatus, Button("Routing", () => workspace.Show("Routing")), performanceStatus);
         outputBar.Margin = new Thickness(12, 0, 4, 0); Grid.SetRow(outputBar, 2); body.Children.Add(outputBar);
         Grid.SetRow(workspace, 3); body.Children.Add(workspace);
         status.Margin = new Thickness(12, 6); status.TextWrapping = Avalonia.Media.TextWrapping.Wrap;
@@ -481,6 +484,9 @@ public sealed partial class MainWindow : Window
             var running = session.IsRunning;
             foreach (var control in stoppedControls) control.IsEnabled = !running && !pendingButtons.Contains(control);
             play.IsEnabled = !running; roll.ReadOnly = running || candidate is not null;
+            if (!running) performanceStatus.IsVisible = false;
+            play.Content = session.Armed is null ? "Play song" : "Record section";
+            playSection.Content = session.Armed is null ? "Play section" : "Record section";
             undo.IsEnabled = !running && session.CanUndo && !pendingButtons.Contains(undo);
             redo.IsEnabled = !running && session.CanRedo && !pendingButtons.Contains(redo);
             UpdateCandidate();
@@ -521,11 +527,22 @@ public sealed partial class MainWindow : Window
         var unit = MusicalTime.Ppq * 4d / meter.Denominator;
         beat.Text = s.Running ? $"{(long)(position / meter.BarTicks) + 1}:{(int)(position / unit) % meter.Numerator + 1}  {meter.Numerator}/{meter.Denominator}" : "Stopped";
         Tip(beat, s.Running ? section.Outline.Name : "Bar and beat within the playing section");
+        var auditionPhase = session.AuditionStatus.Phase;
+        var acceptedSounding = session.Project.Sections.FirstOrDefault(item => item.Id == section.Id);
+        var previewPlaying = playback == "candidate" && ReferenceEquals(section, auditionSection) && !ReferenceEquals(section, acceptedSounding)
+            || auditionPhase is AuditionPhase.Playing or AuditionPhase.Returning;
+        var sounding = playingTake ? "Playing: take" : previewPlaying ? $"Playing preview: {section.Outline.Name}" : $"Playing: {section.Outline.Name}";
+        var target = (record.SelectedItem as Choice)?.Label ?? "part";
+        performanceStatus.Text = (session.Armed is not null ? $"Recording: {target} · " : "") + sounding;
+        performanceStatus.IsVisible = s.Running;
+        Tip(performanceStatus, performanceStatus.Text);
         pulse.Update(meter, position, s.Running);
         roll.Playhead = s.Running && !playingTake && ReferenceEquals(section, DisplaySection) ? position : -1;
         foreach (var c in stoppedControls) c.IsEnabled = !s.Running && !pendingButtons.Contains(c);
         sections.IsEnabled = !s.Running || session.Armed is null;
         play.Content = session.Armed is null ? "Play song" : "Record section";
+        playSection.Content = session.Armed is null ? "Play section" : "Record section";
+        Tip(playSection, session.Armed is null ? "Play the selected section" : "Record input into the selected section; Stop keeps recorded notes");
         play.IsEnabled = !s.Running;
         Tip(play, session.Armed is null ? "Play the song order (F5 play/stop; F8 stop)" : "Record the routing input into the selected section (F5 play/stop; F8 stop)");
         roll.ReadOnly = s.Running || candidate is not null;
