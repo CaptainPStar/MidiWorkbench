@@ -1,6 +1,8 @@
 # Verification status
 
-2026-11-04: source foundation created. No .NET SDK was installed in the execution environment; an HTTPS attempt to obtain the installer timed out. Build, NuGet restore, C# specifications and graphical/hardware runs were not performed. Do not interpret structural verification as compilation.
+2026-11-04: source foundation created without a .NET SDK.
+
+2026-11-04, later: on Linux with SDK 10.0.403, `bash scripts/verify.sh` restored, built Release with 0 warnings and passed 15/15 specifications. CLI `new`, `validate` and `simulate` succeeded on `samples/opening.midiwork.json`. Not yet run: Windows build, desktop/graphical smoke test, hardware. Package lock files are not committed.
 
 ## Implemented source
 
@@ -15,9 +17,9 @@ Seven application/library projects and a console specification project; determin
 - Documentation links to local files resolve.
 - ZIP contents match the source manifest.
 
-## Checks provided but not executed
+## Specifications
 
-Fifteen C# specifications: deterministic generation, note bounds across seeds/meters, protected edits, fixed patterns, tempo continuity, meter length, validation rejection, note release, 24-PPQN clock, late events, skipped-owner isolation, repeated-note ordering, bounded capture, JSON roundtrip, complete simulated playback.
+Fifteen C# specifications, passing on Linux: deterministic generation, note bounds across seeds/meters, protected edits, fixed patterns, tempo continuity, meter length, validation rejection, note release, 24-PPQN clock, late events, skipped-owner isolation, repeated-note ordering, bounded capture, JSON roundtrip, complete simulated playback.
 
 Run `scripts/verify.ps1` or `bash scripts/verify.sh`. These are a dependency-free console test harness, not an xUnit/MSTest project. `dotnet test` alone does not execute them.
 

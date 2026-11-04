@@ -48,7 +48,7 @@ Project save/open never starts playback. Dock layout is local machine state and 
 
 ## Verification status
 
-Created 2026-11-04. No .NET SDK was available in the execution environment and the SDK download timed out. The solution has not been compiled, restored, visually exercised or run against hardware. Structural checks passed; see docs/status.md for exact coverage and remaining checks. Package versions are pinned to the versions observed in MusicSessionTrace, not independently restored here.
+Restores, builds and passes all specifications on Linux with SDK 10.0.403. Not yet built on Windows, visually exercised or run against hardware; see docs/status.md.
 
 ## Documentation
 
@@ -59,6 +59,7 @@ Created 2026-11-04. No .NET SDK was available in the execution environment and t
 - [Project model](docs/project-model.md)
 - [Research and references](docs/research.md)
 - [Implementation milestones](docs/roadmap.md)
+- [End-to-end integration plan](docs/integration.md)
 - [Status and validation](docs/status.md)
 
 No source files were copied from MusicSessionTrace. Its code and documentation informed the architecture and dependency selection. No repository license has been selected; third-party dependencies retain their own licenses.
