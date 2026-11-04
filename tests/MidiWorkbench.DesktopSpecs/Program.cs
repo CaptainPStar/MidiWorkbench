@@ -34,6 +34,12 @@ internal static class Program
             AppBuilder.Configure<WorkbenchApp>().UseSkia()
                 .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).SetupWithoutStarting();
             window = new MainWindow(); window.Show(); Pump();
+            if (args.Contains("--lock-only") || args.Contains("--lock-field-only") || args.Contains("--lock-pointer-only"))
+            {
+                CheckManualNoteLock(args.Contains("--lock-pointer-only") ? "pointer" : args.Contains("--lock-field-only") ? "field" : null);
+                File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
             if (args.Contains("--pad-only"))
             {
                 CheckPadRegisterWorkflow(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
@@ -54,6 +60,17 @@ internal static class Program
                 CheckGeneratorDensityContext(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
                 SetField("closing", true); window.Close(); Pump(); return 0;
             }
+            if (args.Contains("--section-rename-only"))
+            {
+                CheckSectionRename(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            CheckManualNoteLock();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckSectionRename();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
             CheckProgrammaticNoteVisibility();
             SetField("closing", true); window.Close(); Pump();
             window = new MainWindow(); window.Show(); Pump();
@@ -254,6 +271,160 @@ internal static class Program
         var edited = session.SelectedSection.Parts[0].Pattern.Notes.Single(n => n.Id == "beat-precision-319");
         Check(edited.Tick == 240 && edited.Duration == 240, "Quarter-beat field edits commit 240 ticks");
     }
+    private static void CheckManualNoteLock(string? baseline = null)
+    {
+        var session = Field<WorkbenchSession>("session"); var parts = Field<ComboBox>("parts");
+        parts.SelectedItem = parts.ItemsSource!.Cast<object>().Single(item => item.ToString() == "Bass"); Pump();
+        var lockBox = Field<CheckBox>("locked"); var roll = Field<Control>("roll"); var rollType = roll.GetType();
+        var scroll = Field<ScrollViewer>("rollScroll");
+        void SetLock(bool value)
+        {
+            if (lockBox.IsChecked == value) return;
+            var point = lockBox.TranslatePoint(new Point(8, lockBox.Bounds.Height / 2), window)!.Value;
+            window.MouseDown(point, MouseButton.Left, RawInputModifiers.None); window.MouseUp(point, MouseButton.Left, RawInputModifiers.None); Pump();
+            Check(lockBox.IsChecked == value, $"Lock checkbox can be set to {value}");
+        }
+        MidiNote Selected()
+        {
+            var id = (string)rollType.GetProperty("SelectedId")!.GetValue(roll)!;
+            return session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass).Pattern.Notes.Single(n => n.Id == id);
+        }
+        MidiNote AddField(bool value, int pitch, decimal beat)
+        {
+            SetLock(value); Field<NumericUpDown>("pitch").Value = pitch; Field<NumericUpDown>("tick").Value = beat;
+            Click("Add note"); Pump(); var note = Selected();
+            Check(note.Locked == value && lockBox.IsChecked == value, $"Field-added note and selected Lock both show {value}"); return note;
+        }
+        MidiNote AddPointer(bool value, int pitch, double x)
+        {
+            SetLock(value); scroll.Offset = new Vector(0, 900); Pump();
+            var point = roll.TranslatePoint(new Point(106 + x, 26 + (127 - pitch) * 22 + 8), window)!.Value;
+            window.MouseDown(point, MouseButton.Left, RawInputModifiers.None); window.MouseUp(point, MouseButton.Left, RawInputModifiers.None); Pump();
+            var note = Selected();
+            Check(note.Pitch == pitch && note.Locked == value && lockBox.IsChecked == value, $"Pointer-added note and selected Lock both show {value}"); return note;
+        }
+        if (baseline == "field") { AddField(false, 84, 3); return; }
+        if (baseline == "pointer") { AddPointer(false, 80, 120); return; }
+        Check(lockBox.IsChecked == true, "Manual note entry starts with Lock checked");
+        var fieldLocked = AddField(true, 84, 3); var fieldUnlocked = AddField(false, 85, 5);
+        var pointerLocked = AddPointer(true, 80, 120); var pointerUnlocked = AddPointer(false, 81, 360);
+        var part = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass);
+        Check(part.Pattern.Kind != PatternKind.Fixed, "Manual lock test uses a regenerable pattern");
+        SendKey(Key.Z, KeyModifiers.Control);
+        Check(!session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass).Pattern.Notes.Any(n => n.Id == pointerUnlocked.Id), "Undo removes the last unlocked pointer note");
+        SendKey(Key.Z, KeyModifiers.Control | KeyModifiers.Shift);
+        Check(session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass).Pattern.Notes.Any(n => n.Id == pointerUnlocked.Id && !n.Locked), "Redo restores the unlocked pointer note");
+        rollType.GetMethod("Select")!.Invoke(roll, [fieldLocked.Id]); Pump(); SetLock(false); Click("Apply"); Pump();
+        Check(!session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass).Pattern.Notes.Single(n => n.Id == fieldLocked.Id).Locked,
+            "Apply still changes the selected existing note's lock");
+        SendKey(Key.Z, KeyModifiers.Control);
+        Check(session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass).Pattern.Notes.Single(n => n.Id == fieldLocked.Id).Locked,
+            "Undo restores the existing note's lock");
+        rollType.GetMethod("SelectMany")!.Invoke(roll, [new[] { fieldLocked.Id, fieldUnlocked.Id }, fieldLocked.Id]); Pump();
+        roll.Focus(); SendKey(Key.C, KeyModifiers.Control); SendKey(Key.V, KeyModifiers.Control);
+        var pasted = (ImmutableArray<MidiNote>)rollType.GetProperty("SelectedNotes")!.GetValue(roll)!;
+        Check(pasted.Length == 2 && pasted.Count(n => n.Locked) == 1 && pasted.Count(n => !n.Locked) == 1,
+            "Copy and paste preserve each source note's lock state");
+        SendKey(Key.Z, KeyModifiers.Control);
+        var path = Path.Combine(evidence, "manual-lock-project.midiwork.json"); SetField("projectPath", path); SendKey(Key.S, KeyModifiers.Control); Until(() => File.Exists(path));
+        session.Load(path); Invoke("Reload"); Pump();
+        var saved = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass).Pattern.Notes;
+        Check(saved.Single(n => n.Id == fieldLocked.Id).Locked && !saved.Single(n => n.Id == fieldUnlocked.Id).Locked
+            && saved.Single(n => n.Id == pointerLocked.Id).Locked && !saved.Single(n => n.Id == pointerUnlocked.Id).Locked,
+            "Save and reopen preserve the checked and unchecked manual notes");
+        var generator = Field<Control>("generators"); var type = generator.GetType();
+        var preview = (Button)type.GetField("preview", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        preview.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null || session.GenerationStatus.Phase == GenerationPhase.Failed);
+        var regenerated = (session.Candidate ?? throw new InvalidOperationException($"Preview failed: {session.GenerationStatus.Error}"))
+            .Parts.Single(p => p.Role == PartRole.Bass).Pattern.Notes;
+        Check(regenerated.Any(n => n.Id == fieldLocked.Id) && regenerated.Any(n => n.Id == pointerLocked.Id)
+            && !regenerated.Any(n => n.Id == fieldUnlocked.Id || n.Id == pointerUnlocked.Id),
+            "Scoped regeneration preserves locked manual notes and replaces unlocked manual notes");
+        Field<Button>("discard").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+    }
+    private static void CheckSectionRename()
+    {
+        var session = Field<WorkbenchSession>("session"); var part = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Bass);
+        var motif = Enumerable.Range(0, 6).Select(i => new MidiNote($"rename-motif-{i}", i * 480L, 240, 48 + i, 80 + i, false)).ToArray();
+        session.EditNotes(part.Id, motif, part.Pattern.Notes.Select(n => n.Id)); session.SetPatternKind(part.Id, PatternKind.Generative); Invoke("Reload"); Pump();
+        var before = session.SelectedSection.Parts.Single(p => p.Id == part.Id).Pattern;
+        var rename = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "Rename section"));
+        void StartRename() { rename.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump(); }
+        Window Dialog(string title) => window.OwnedWindows.Single(w => w.Title == title);
+        void EnterName(string value)
+        {
+            var dialog = Dialog("Rename section"); var input = dialog.GetVisualDescendants().OfType<TextBox>().Single(); input.Text = value;
+            dialog.KeyPress(Key.Enter, RawInputModifiers.None, PhysicalKey.None, null);
+            if (dialog.IsVisible) dialog.KeyRelease(Key.Enter, RawInputModifiers.None, PhysicalKey.None, null);
+            Pump();
+        }
+        StartRename(); EnterName("  ");
+        Check(Dialog("Rename section").IsVisible && session.SelectedSection.Outline.Name == "Opening", "Blank section name is rejected without changing material");
+        Click(Dialog("Rename section"), "Cancel"); Pump();
+        Check(session.SelectedSection.Outline.Name == "Opening" && ReferenceEquals(before, session.SelectedSection.Parts.Single(p => p.Id == part.Id).Pattern),
+            "Cancel section rename preserves the accepted motif");
+        var scale = Field<TextBox>("scale"); var originalScale = scale.Text; scale.Text = "invalid,scale";
+        var density = Field<Slider>("density"); var originalDensity = density.Value; density.Value = .79;
+        var complexity = Field<Slider>("complexity"); var originalComplexity = complexity.Value; complexity.Value = .83;
+        var generator = Field<Control>("generators"); var generatorSeed = (NumericUpDown)generator.GetType().GetField("seed", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        var originalGeneratorSeed = generatorSeed.Value; generatorSeed.Value = (originalGeneratorSeed ?? 0) + 7;
+        StartRename(); EnterName("  Chorus  ");
+        Check(session.SelectedSection.Outline.Name == "Chorus" && session.SelectedSection.Parts.Single(p => p.Id == part.Id).Pattern.Notes.SequenceEqual(motif),
+            "Metadata rename preserves all six unlocked motif notes");
+        Check(scale.Text == "invalid,scale" && density.Value == .79 && complexity.Value == .83 && generatorSeed.Value == originalGeneratorSeed + 7,
+            "Section rename retains invalid outline, density, drummer and generator drafts");
+        scale.Text = originalScale; density.Value = originalDensity; complexity.Value = originalComplexity; generatorSeed.Value = originalGeneratorSeed;
+        SendKey(Key.Z, KeyModifiers.Control);
+        Check(session.SelectedSection.Outline.Name == "Opening" && session.SelectedSection.Parts.Single(p => p.Id == part.Id).Pattern.Notes.SequenceEqual(motif),
+            "Undo section rename preserves the motif");
+        SendKey(Key.Z, KeyModifiers.Control | KeyModifiers.Shift);
+        Check(session.SelectedSection.Outline.Name == "Chorus" && session.SelectedSection.Parts.Single(p => p.Id == part.Id).Pattern.Notes.SequenceEqual(motif),
+            "Redo section rename preserves the motif");
+
+        Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null); var preview = session.Candidate;
+        StartRename(); EnterName(" Chorus ");
+        Check(ReferenceEquals(session.Candidate, preview) && !window.OwnedWindows.Any(w => w.Title == "Unaccepted preview"), "No-op section rename retains the preview without a warning");
+        scale.Text = "still,invalid"; density.Value = .71; complexity.Value = .81; generatorSeed.Value = (generatorSeed.Value ?? 0) + 4;
+        var changedGeneratorSeed = generatorSeed.Value;
+        StartRename(); EnterName("Verse"); Click(Dialog("Unaccepted preview"), "Cancel"); Pump();
+        Check(ReferenceEquals(session.Candidate, preview) && session.SelectedSection.Outline.Name == "Chorus" && scale.Text == "still,invalid",
+            "Cancelling preview-discard confirmation preserves the section and preview");
+        StartRename(); EnterName("Verse"); Click(Dialog("Unaccepted preview"), "Discard preview"); Pump();
+        Check(session.Candidate is null && session.SelectedSection.Outline.Name == "Verse"
+            && session.SelectedSection.Parts.Single(p => p.Id == part.Id).Pattern.Notes.SequenceEqual(motif)
+            && scale.Text == "still,invalid" && density.Value == .71 && complexity.Value == .81 && generatorSeed.Value == changedGeneratorSeed,
+            "Confirmed section rename preserves accepted motif and unrelated drafts while discarding only the preview");
+        var parts = Field<ComboBox>("parts"); parts.SelectedItem = parts.ItemsSource!.Cast<object>().Single(item => item.ToString() == "Bass"); Pump();
+        if (window.OwnedWindows.Any(w => w.Title == "Unaccepted changes")) { Click(Dialog("Unaccepted changes"), "Discard changes"); Pump(); }
+        var previewPart = (Button)generator.GetType().GetField("preview", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        previewPart.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null && Field<TextBlock>("candidateLabel").Text!.StartsWith("Preview ready", StringComparison.Ordinal));
+        var partPreview = session.Candidate; generatorSeed.Value = (generatorSeed.Value ?? 0) + 9;
+        bool GeneratorDirty() => (bool)generator.GetType().GetProperty("HasDraft")!.GetValue(generator)!;
+        Check(GeneratorDirty(), "Editing the preview recipe creates a generator draft");
+        StartRename(); EnterName("Bridge"); var specificWarning = Dialog("Unaccepted preview");
+        Check(specificWarning.GetVisualDescendants().OfType<TextBlock>().Any(t => t.Text?.Contains("generator settings") == true),
+            "Section rename names candidate-based generator settings in the discard warning");
+        Click(specificWarning, "Cancel"); Pump();
+        Check(ReferenceEquals(session.Candidate, partPreview) && GeneratorDirty() && session.SelectedSection.Outline.Name == "Verse",
+            "Cancel retains candidate-based generator draft and preview");
+        StartRename(); EnterName("Bridge"); Click(Dialog("Unaccepted preview"), "Discard preview"); Pump();
+        Check(session.Candidate is null && !GeneratorDirty() && session.SelectedSection.Outline.Name == "Bridge"
+            && session.SelectedSection.Parts.Single(p => p.Id == part.Id).Pattern.Notes.SequenceEqual(motif)
+            && scale.Text == "still,invalid" && density.Value == .71 && complexity.Value == .81,
+            "Confirmed rename discards candidate-based generator draft but preserves accepted motif and unrelated drafts");
+        scale.Text = originalScale; density.Value = originalDensity; complexity.Value = originalComplexity;
+        var path = Path.Combine(evidence, "renamed-section.midiwork.json"); SetField("projectPath", path); SendKey(Key.S, KeyModifiers.Control); Until(() => File.Exists(path));
+        Check(ProjectStore.Load(path).Sections[0].Outline.Name == "Bridge" && ProjectStore.Load(path).Sections[0].Parts.Single(p => p.Id == part.Id).Pattern.Notes.SequenceEqual(motif),
+            "Saving and reopening retain the section name and motif");
+        session.StartSection(repeat: true); Until(() => session.IsRunning);
+        Check(!rename.IsEffectivelyEnabled, "Section rename action is disabled during playback");
+        rename.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(!window.OwnedWindows.Any(w => w.Title == "Rename section"), "Section rename does not open while playback is running");
+        session.Stop(); Pump();
+    }
     private static void CheckDiscardedDrafts()
     {
         var session = Field<WorkbenchSession>("session"); var originalOutline = session.SelectedSection.Outline;
@@ -268,14 +439,14 @@ internal static class Program
         void SetRepeats() { set.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump(); }
         Window Warning() => window.OwnedWindows.Single(w => w.Title == "Unaccepted changes");
         bool HasDraft() => (bool)typeof(MainWindow).GetMethod("HasUnacceptedChanges", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, null)!;
-        Field<TextBox>("sectionName").Text = "Unapplied name"; complexity.Value = .91; generatorSeed.Value = (originalSeed ?? 0) + 7;
+        Field<Slider>("density").Value = .88; complexity.Value = .91; generatorSeed.Value = (originalSeed ?? 0) + 7;
         repeats.Value = 2; SetRepeats(); Click(Warning(), "Cancel"); Pump();
-        Check(session.Project.Arrangement.IsEmpty && Field<TextBox>("sectionName").Text == "Unapplied name"
+        Check(session.Project.Arrangement.IsEmpty && Field<Slider>("density").Value == .88
             && complexity.Value == .91 && generatorSeed.Value == (originalSeed ?? 0) + 7,
             "Cancel arrangement change preserves accepted order and all drafts");
         SetRepeats(); Click(Warning(), "Discard changes"); Pump();
         Check(session.Project.Arrangement.Length == 1 && session.Project.Arrangement[0].Repeats == 2, "Discard permits the requested arrangement change");
-        Check(Field<TextBox>("sectionName").Text == originalOutline.Name && complexity.Value == initialComplexity && generatorSeed.Value == originalSeed && !HasDraft(),
+        Check(Field<Slider>("density").Value == originalOutline.Density && complexity.Value == initialComplexity && generatorSeed.Value == originalSeed && !HasDraft(),
             "Discard restores outline, drummer and generator drafts to accepted values");
         repeats.Value = 3; SetRepeats();
         Check(!window.OwnedWindows.Any(w => w.Title == "Unaccepted changes") && session.Project.Arrangement[0].Repeats == 3,
@@ -283,20 +454,20 @@ internal static class Program
 
         Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
         Until(() => session.Candidate is not null); var candidate = session.Candidate;
-        Field<TextBox>("sectionName").Text = "Keep this outline draft"; complexity.Value = .87;
+        Field<Slider>("density").Value = .75; complexity.Value = .87;
         generatorSeed.Value = (generatorSeed.Value ?? 0) + 1;
         var parts = Field<ComboBox>("parts"); var prior = parts.SelectedIndex; parts.SelectedIndex = prior == 0 ? 1 : 0; Pump();
         Check(Warning().GetVisualDescendants().OfType<TextBlock>().Any(t => t.Text == "Discard unapplied generator settings?"),
             "Part-change warning identifies its generator-only discard scope");
         Click(Warning(), "Discard changes"); Pump();
         Check(parts.SelectedIndex != prior && ReferenceEquals(session.Candidate, candidate)
-            && Field<TextBox>("sectionName").Text == "Keep this outline draft" && complexity.Value == .87,
+            && Field<Slider>("density").Value == .75 && complexity.Value == .87,
             "Discarding a part-generator draft keeps the preview and unrelated outline and drummer drafts");
         repeats.Value = 4; SetRepeats(); Click(Warning(), "Cancel"); Pump();
-        Check(ReferenceEquals(session.Candidate, candidate) && Field<TextBox>("sectionName").Text == "Keep this outline draft"
+        Check(ReferenceEquals(session.Candidate, candidate) && Field<Slider>("density").Value == .75
             && session.Project.Arrangement[0].Repeats == 3, "Cancel preserves preview, unrelated drafts and accepted arrangement");
         SetRepeats(); Click(Warning(), "Discard changes"); Pump();
-        Check(session.Candidate is null && Field<TextBox>("sectionName").Text == originalOutline.Name && !HasDraft()
+        Check(session.Candidate is null && Field<Slider>("density").Value == originalOutline.Density && !HasDraft()
             && session.Project.Arrangement[0].Repeats == 4, "General discard clears preview and drafts after the requested action");
         var scale = Field<TextBox>("scale"); var originalScale = scale.Text; scale.Text = "invalid scale";
         repeats.Value = 5; SetRepeats(); Click(Warning(), "Cancel"); Pump();
@@ -607,9 +778,9 @@ internal static class Program
         SetNameAndEnter("New bank", "Festival");
         Check(session.Bank?.Name == "Festival" && Field<TextBlock>("bankName").Text == "Festival", "Creating a bank uses the requested name");
         Activate("Add current");
-        Field<TextBox>("sectionName").Text = "Unapplied verse";
+        var sectionScale = Field<TextBox>("scale"); var originalScale = sectionScale.Text; sectionScale.Text = "0,2,3,5,7,8,10";
         Click("Rename song"); SetNameAndEnter("Rename song", "Second Song");
-        Check(session.Project.Name == "Second Song" && Field<TextBox>("sectionName").Text == "Unapplied verse", "Song rename preserves unapplied section settings");
+        Check(session.Project.Name == "Second Song" && sectionScale.Text == "0,2,3,5,7,8,10", "Song rename preserves unapplied section settings");
         Activate("Add current");
         Check(session.Bank!.Songs.Select(s => s.Project.Name).SequenceEqual(["First Song", "Second Song"])
             && Field<ListBox>("bankOrder").ItemsSource!.Cast<object>().Select(o => o.ToString()).SequenceEqual(["1. First Song", "2. Second Song"]),
@@ -635,9 +806,9 @@ internal static class Program
         var warning = Dialog("Unaccepted preview"); Click(warning, "Cancel"); Pump();
         Check(session.Project.Name == "Second Song" && ReferenceEquals(session.Candidate, preview), "Cancelling rename preserves the prepared preview and name");
         Click("Rename song"); SetNameAndEnter("Rename song", "Third Song"); Click(Dialog("Unaccepted preview"), "Discard preview"); Pump();
-        Check(session.Project.Name == "Third Song" && session.Candidate is null && Field<TextBox>("sectionName").Text == "Unapplied verse",
+        Check(session.Project.Name == "Third Song" && session.Candidate is null && sectionScale.Text == "0,2,3,5,7,8,10",
             "Confirmed rename discards only the preview and retains outline draft");
-        Field<TextBox>("sectionName").Text = session.SelectedSection.Outline.Name;
+        sectionScale.Text = originalScale;
         Until(() => !Field<bool>("documentDialog"));
         workspace.GetType().GetMethod("Reset")!.Invoke(workspace, null); Pump();
         SetField("savedProject", session.Project); SetField("savedBank", session.Bank!); window.Close(); Pump();
@@ -645,16 +816,16 @@ internal static class Program
     }
     private static void CheckOutlineDraftProtection(WorkbenchSession session)
     {
-        var name = Field<TextBox>("sectionName"); var originalName = name.Text;
-        name.Text = "Pending section name";
+        var outlineSeed = Field<NumericUpDown>("seed"); var originalSeed = outlineSeed.Value;
+        outlineSeed.Value = (originalSeed ?? 0) + 7;
         Field<NumericUpDown>("tempo").Value = 121; Click("Set");
-        Check(name.Text == "Pending section name", "Tempo reload preserves unapplied section settings");
+        Check(outlineSeed.Value == originalSeed + 7, "Tempo reload preserves unapplied section settings");
         SendKey(Key.Z, KeyModifiers.Control);
         Check(window.OwnedWindows.Single().Title == "Unaccepted changes", "Undo protects unapplied section settings");
         Click(window.OwnedWindows.Single(), "Cancel"); Pump();
         session.Undo(); Invoke("Reload");
         SendKey(Key.F8);
-        Check(name.Text == "Pending section name", "Stop and ordinary reload preserve unapplied section settings");
+        Check(outlineSeed.Value == originalSeed + 7, "Stop and ordinary reload preserve unapplied section settings");
         Check(!window.Title!.StartsWith('*'), "Undo tempo returns accepted project to clean state");
         window.Close(); Pump();
         var dialog = window.OwnedWindows.Single();
@@ -664,18 +835,18 @@ internal static class Program
         Check(dialog.GetVisualDescendants().OfType<Button>().Count(b => b.IsEffectivelyVisible) == 2,
             "Unaccepted-change decision offers discard and cancel");
         Click(dialog, "Cancel"); Pump();
-        Check(window.IsVisible && name.Text == "Pending section name", "Cancel close preserves unapplied outline");
-        name.Text = originalName;
+        Check(window.IsVisible && outlineSeed.Value == originalSeed + 7, "Cancel close preserves unapplied outline");
+        outlineSeed.Value = originalSeed;
         Check(ReferenceEquals(Field<SongProject>("savedProject"), session.Project), "Draft protection does not mutate accepted project");
 
         var firstSection = session.SelectedSectionId;
         session.AddSection(); session.SelectSection(firstSection); Invoke("Reload");
-        name.Text = "Section switch draft";
+        outlineSeed.Value = (originalSeed ?? 0) + 9;
         Field<ComboBox>("sections").SelectedIndex = 1; Pump();
         Check(window.OwnedWindows.Single().Title == "Unaccepted changes", "Changing section protects outline draft");
         Click(window.OwnedWindows.Single(), "Cancel"); Pump();
-        Check(session.SelectedSectionId == firstSection && name.Text == "Section switch draft", "Cancel restores section selection and draft");
-        name.Text = originalName; session.Undo(); Invoke("Reload");
+        Check(session.SelectedSectionId == firstSection && outlineSeed.Value == originalSeed + 9, "Cancel restores section selection and draft");
+        outlineSeed.Value = originalSeed; session.Undo(); Invoke("Reload");
 
         var complexity = Field<Slider>("complexity"); var initialComplexity = complexity.Value;
         complexity.Value = initialComplexity == .9 ? .8 : .9;

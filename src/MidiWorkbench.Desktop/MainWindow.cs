@@ -32,7 +32,7 @@ public sealed partial class MainWindow : Window
     private readonly TextBlock performanceStatus = new() { MaxWidth = 360, TextTrimming = Avalonia.Media.TextTrimming.CharacterEllipsis, VerticalAlignment = VerticalAlignment.Center, IsVisible = false };
     private readonly TextBlock takeHistoryHint = new() { Text = "Recent takes; Load take opens older recordings.", IsVisible = false, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly TextBlock status = new(), beat = new() { FontSize = 20, MinWidth = 120 }, activity = new(), candidateLabel = new();
-    private readonly TextBox sectionName = new(), scale = new();
+    private readonly TextBox scale = new();
     private readonly TextBlock bankName = new() { Text = "No bank", TextWrapping = Avalonia.Media.TextWrapping.Wrap };
     private readonly ComboBox bankSongs = new() { MinWidth = 180 };
     private readonly ListBox bankOrder = new() { MinHeight = 90, MaxHeight = 200 };
@@ -46,7 +46,7 @@ public sealed partial class MainWindow : Window
         swing = new() { Minimum = 0, Maximum = .45, MinWidth = 140 };
     private readonly ComboBox drummer = new() { ItemsSource = new[] { "Basic" }.Concat(DrumPersonas.All.Select(p => p.Name)).ToArray(), SelectedIndex = 1 };
     private readonly CheckBox halfTime = new() { Content = "Half-time" }, loop = new() { Content = "Loop" },
-        mute = new() { Content = "Mute" }, solo = new() { Content = "Solo" }, locked = new() { Content = "Lock" };
+        mute = new() { Content = "Mute" }, solo = new() { Content = "Solo" }, locked = new() { Content = "Lock", IsChecked = true };
     private readonly ComboBox record = new() { MinWidth = 160 }, takes = new() { MinWidth = 240 },
         mode = new() { ItemsSource = new[] { "Piano roll", "Drum grid" }, SelectedIndex = 0 },
         snap = new() { ItemsSource = new[] { "1/4", "1/8", "1/16", "1/32", "1/8T", "1/16T", "Off" }, SelectedIndex = 2 };
@@ -113,7 +113,8 @@ public sealed partial class MainWindow : Window
         var sectionTools = Wrap(AsyncButton("Add", () => GuardDraftChange(() => { session.AddSection(); ClearCandidate(); Reload(); }), true),
             AsyncButton("Duplicate", () => GuardDraftChange(() => { session.DuplicateSection(session.SelectedSectionId); ClearCandidate(); Reload(); }), true),
             AsyncButton("Remove", () => GuardDraftChange(() => { session.RemoveSection(session.SelectedSectionId); ClearCandidate(); Reload(); }), true),
-            AsyncButton("Up", () => GuardDraftChange(() => MoveSection(-1)), true), AsyncButton("Down", () => GuardDraftChange(() => MoveSection(1)), true));
+            AsyncButton("Up", () => GuardDraftChange(() => MoveSection(-1)), true), AsyncButton("Down", () => GuardDraftChange(() => MoveSection(1)), true),
+            AsyncButton("Rename section", RenameSection, true, true));
         Tip(sectionTools, "Reorder sections; the song follows this order unless a custom song order is set");
         drummer.SelectionChanged += (_, _) => { if (!loading && drummer.SelectedIndex > 0) ShowDrummer(DrumPersonas.All[drummer.SelectedIndex - 1].Id, null); };
         Tip(complexity, "Drum activity; other parts use density");
@@ -131,7 +132,7 @@ public sealed partial class MainWindow : Window
         AutomationProperties.SetName(candidateBoundary, "Candidate boundary");
         Tip(accept, "Commit the candidate. During playback, queue it at the chosen boundary. Cancelling a queued launch does not undo the accepted edit.");
         var outlineSettings = Column(Label("Sections", sections), sectionTools,
-            new Expander { Header = "Section settings", IsExpanded = true, Content = Column(new TextBlock { Text = "Apply changes with Preview section, then Accept.", TextWrapping = Avalonia.Media.TextWrapping.Wrap }, Label("Name", sectionName),
+            new Expander { Header = "Section settings", IsExpanded = true, Content = Column(new TextBlock { Text = "Apply changes with Preview section, then Accept.", TextWrapping = Avalonia.Media.TextWrapping.Wrap },
                 Wrap(Label("Bars", bars), Label("Meter", Wrap(numerator, denominator))),
                 Wrap(PitchLabel("Root note", root), Label("Seed", seed)), Label("Scale intervals", scale),
                 AmountLabel("Density", density), AmountLabel("Intensity", intensity), AmountLabel("Variation", variation)) },
@@ -170,6 +171,8 @@ public sealed partial class MainWindow : Window
         zoom.PropertyChanged += (_, e) => { if (e.Property == Slider.ValueProperty) roll.Zoom = zoom.Value; };
         velocity.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) roll.NewVelocity = (int)(velocity.Value ?? 90); };
         duration.PropertyChanged += (_, e) => { if (e.Property == NumericUpDown.ValueProperty) roll.NewDuration = BeatsToTicks(duration.Value ?? .25m); };
+        locked.IsCheckedChanged += (_, _) => roll.NewLocked = locked.IsChecked == true;
+        Tip(locked, "Locked notes are preserved when generative or hybrid parts regenerate.");
         mute.IsCheckedChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p) Try(() => { session.SetPartMute(p.Id, mute.IsChecked == true); RefreshNotes(); }); };
         solo.IsCheckedChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p) Try(() => { session.SetPartSolo(p.Id, solo.IsChecked == true); RefreshNotes(); }); };
         patternKind.SelectionChanged += (_, _) => { if (!loading && candidate is null && SelectedPart() is { } p && patternKind.SelectedItem is PatternKind kind) Try(() => { session.SetPatternKind(p.Id, kind); RefreshNotes(); }); };
@@ -302,7 +305,7 @@ public sealed partial class MainWindow : Window
     {
         var s = stored ?? DrumPersonas.Settings(persona); complexity.Value = s.Complexity; fills.Value = s.Fills; swing.Value = s.Swing; halfTime.IsChecked = s.HalfTime;
     }
-    private Outline ReadOutline() => new(sectionName.Text ?? "Section", (int)(bars.Value ?? 8),
+    private Outline ReadOutline() => new(session.SelectedSection.Outline.Name, (int)(bars.Value ?? 8),
         new Meter((int)(numerator.Value ?? 4), (int)(denominator.SelectedItem ?? 4)), (int)(root.Value ?? 40),
         (scale.Text ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToImmutableArray(),
         density.Value, intensity.Value, variation.Value, (uint)(seed.Value ?? 1));
@@ -398,7 +401,7 @@ public sealed partial class MainWindow : Window
             launchSection.ItemsSource = choices; launchSection.SelectedItem = choices.FirstOrDefault(c => c.Id == launch) ?? choices[0];
             if (!ReferenceEquals(loadedOutline, o))
             {
-                sectionName.Text = o.Name; bars.Value = o.Bars; numerator.Value = o.Meter.Numerator; denominator.SelectedItem = o.Meter.Denominator;
+                bars.Value = o.Bars; numerator.Value = o.Meter.Numerator; denominator.SelectedItem = o.Meter.Denominator;
                 root.Value = o.Root; scale.Text = string.Join(',', o.Scale); seed.Value = o.Seed;
                 density.Value = o.Density; intensity.Value = o.Intensity; variation.Value = o.Variation;
                 var drums = section.Parts.FirstOrDefault(p => p.Role == PartRole.Drums)?.Pattern.Recipe;
@@ -477,7 +480,7 @@ public sealed partial class MainWindow : Window
         catch (Exception ex) { status.Text = ex.Message; return false; }
     }
     private void ApplyNote() { if (roll.SelectedId is { } id) roll.ApplyFields(Edited(id)); }
-    private void AddNote() => roll.Add(Edited(Guid.NewGuid().ToString("N")) with { Locked = true });
+    private void AddNote() => roll.Add(Edited(Guid.NewGuid().ToString("N")));
     private void DeleteNote() => roll.DeleteSelection();
     private void TryTransport()
     {

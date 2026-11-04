@@ -51,6 +51,7 @@ internal sealed class NoteEditor : Control
     public bool ReadOnly { get; set; }
     public int NewVelocity { get; set; } = 90;
     public long NewDuration { get; set; } = 240;
+    public bool NewLocked { get; set; } = true;
     public long SnapTicks { get => snap; set { snap = Math.Max(1, value); InvalidateVisual(); } }
     public double Zoom { get => pixelsPerQuarter; set { pixelsPerQuarter = Math.Clamp(value, 24, 240); Resize(); } }
     public double Playhead { get => playhead; set { if (Math.Abs(playhead - value) > .01) { playhead = value; InvalidateVisual(); } } }
@@ -365,7 +366,7 @@ internal sealed class NoteEditor : Control
         CancelGesture(); e.Pointer.Capture(null);
         if (add && outline is not null)
         {
-            var note = new MidiNote(Guid.NewGuid().ToString("N"), at, Math.Min(Math.Max(1, NewDuration), outline.LengthTicks - at), PitchAt(pos.Y), NewVelocity, true);
+            var note = new MidiNote(Guid.NewGuid().ToString("N"), at, Math.Min(Math.Max(1, NewDuration), outline.LengthTicks - at), PitchAt(pos.Y), NewVelocity, NewLocked);
             Add(note, reveal: false); insertTick = note.EndTick;
         }
         else if (changed.Length > 0) Publish(changed, [], selected, reveal: false);

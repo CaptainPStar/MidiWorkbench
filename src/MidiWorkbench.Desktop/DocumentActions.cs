@@ -38,6 +38,26 @@ public sealed partial class MainWindow
         session.RenameProject(name); candidate = null; Reload();
     }
 
+    private async Task RenameSection()
+    {
+        if (session.IsRunning) throw new InvalidOperationException("Stop playback before renaming a section.");
+        var section = session.SelectedSection;
+        var name = await AskName("Rename section", section.Outline.Name, "Rename");
+        if (name is null || name == section.Outline.Name) return;
+        var selectedId = SelectedPart()?.Id;
+        var acceptedSettings = section.Parts.FirstOrDefault(p => p.Id == selectedId)?.Pattern.Recipe?.Settings;
+        var discardGeneratorDraft = generators.HasDraft && !ReferenceEquals(loadedGeneratorSettings, acceptedSettings);
+        var message = discardGeneratorDraft ? "Renaming will discard the preview and its unapplied generator settings. Continue?"
+            : "Renaming will discard the current preview. Continue?";
+        if ((session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing)
+            && await ConfirmSave("Unaccepted preview", message, null, "Discard preview") != 2) return;
+        session.RenameSection(section.Id, name); candidate = null;
+        // Only the name changed: retain unfinished outline controls against the
+        // newly accepted outline. Unchanged generator settings retain their drafts.
+        loadedOutline = session.SelectedSection.Outline;
+        Reload();
+    }
+
     private async Task NewBank()
     {
         var name = await AskName("New bank", "Bank", "Create");

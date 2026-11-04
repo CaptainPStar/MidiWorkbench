@@ -128,6 +128,24 @@ public sealed class WorkbenchSession : IDisposable
     {
         lock (gate) { if (Running && armed is not null) throw new InvalidOperationException("Stop recording before selecting a section."); if (!project.Sections.Any(s => s.Id == id)) throw new ArgumentException("Unknown section."); if (id != selectedSectionId) { CancelDiscardedAudition(returnPlaying: true); InvalidateGeneration(); } if (!Running) { CommitRecording(); Await(host.Arm(null, 1)); armed = null; } selectedSectionId = id; }
     }
+    public void RenameSection(string sectionId, string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Enter a section name.", nameof(name));
+        name = name.Trim();
+        lock (gate)
+        {
+            EnsureOpen();
+            var index = Array.FindIndex(project.Sections.ToArray(), s => s.Id == sectionId);
+            if (index < 0) throw new ArgumentException("Unknown section.", nameof(sectionId));
+            RequireStopped();
+            if (project.Sections[index].Outline.Name == name) return;
+            CommitRecording();
+            // Recording may have added protected material to this section. Read its
+            // current snapshot after that commit before changing metadata alone.
+            var section = project.Sections[index];
+            Apply(project with { Sections = project.Sections.SetItem(index, section with { Outline = section.Outline with { Name = name } }) });
+        }
+    }
     public string AddSection()
     {
         lock (gate) { RequireStopped(); CommitRecording(); var source = project.Sections[SectionIndex];
