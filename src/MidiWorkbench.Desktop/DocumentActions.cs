@@ -42,6 +42,7 @@ public sealed partial class MainWindow
         var clocks = rig.Endpoints.Count(e => e.SendClock && e.Id is not ("memory" or "loopback"));
         outputStatus.Text = missing.Length > 0 ? $"Not routed: {string.Join(", ", missing)}. Choose outputs in Routing."
             : offline.Length > 0 ? $"Output offline: {string.Join(", ", offline)}. Check Routing."
+            : real.Length == 0 && clocks > 0 ? $"Notes: simulation · Clock enabled: {clocks} output(s). Choose note outputs in Routing."
             : real.Length == 0 ? "Simulation — no MIDI sent to instruments. Choose outputs in Routing."
             : $"MIDI: {string.Join(", ", real.Select(id => available.FirstOrDefault(e => e.Id == id)?.Name ?? id))} · Clock {(clocks == 0 ? "off" : $"enabled: {clocks} output(s)")}{(simulated > 0 ? $" · {simulated} simulated route(s)" : "")}";
         outputStatus.Foreground = missing.Length > 0 || offline.Length > 0 ? Brushes.Orange : Brushes.LightGray;
@@ -53,6 +54,7 @@ public sealed partial class MainWindow
         var path = projectPath;
         if (saveAs || path is null)
         {
+            RequireStoppedForPicker();
             var file = await StorageProvider.SaveFilePickerAsync(new()
             {
                 Title = "Save project", SuggestedFileName = path is null ? "song.midiwork.json" : Path.GetFileName(path),
@@ -63,7 +65,7 @@ public sealed partial class MainWindow
         }
         session.Save(path); savedProject = session.Project; projectPath = path;
         RefreshDocumentTitle();
-        status.Text = $"Saved {Path.GetFileName(path)}" + (session.Armed is not null && session.Status().Running ? ". Recording continues; stop and save again to include this phrase."
+        status.Text = $"Saved {Path.GetFileName(path)}" + (session.Armed is not null && session.IsRunning ? ". Recording continues; stop and save again to include this phrase."
             : session.Candidate is not null ? ". Preview is not included; accept it to keep it." : "");
         return true;
     }
@@ -82,6 +84,7 @@ public sealed partial class MainWindow
     private bool HasUnacceptedChanges()
     {
         if (session.Candidate is not null || session.GenerationStatus.Phase == MidiWorkbench.Application.GenerationPhase.Preparing) return true;
+        if (generators.HasDraft || loadedDrummer is { } drums && drums != CurrentDrummer()) return true;
         if (loadedOutline is null) return false;
         try
         {
@@ -89,6 +92,20 @@ public sealed partial class MainWindow
             return edited with { Scale = loadedOutline.Scale } != loadedOutline || !edited.Scale.SequenceEqual(loadedOutline.Scale);
         }
         catch (Exception ex) when (ex is ArgumentException or FormatException or OverflowException) { return true; }
+    }
+
+    private async Task GuardDraftChange(Action action, bool generatorOnly = false)
+    {
+        if (documentDialog || closePending) return;
+        documentDialog = true;
+        try
+        {
+            var changed = generatorOnly ? generators.HasDraft : HasUnacceptedChanges();
+            if (changed && await ConfirmSave("Unaccepted changes", "Discard the preview and unapplied settings?", null, "Discard changes") != 2) return;
+            action();
+        }
+        catch (Exception ex) { status.Text = ex.Message; }
+        finally { documentDialog = false; }
     }
 
     private async Task<bool> ConfirmBankReplacement()
@@ -105,6 +122,7 @@ public sealed partial class MainWindow
     {
         var dialog = new Window { Title = title, Width = 460, SizeToContent = SizeToContent.Height, CanResize = false,
             WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false };
+        dialog.AddHandler(KeyDownEvent, HandleShortcuts, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         var cancel = new Button { Content = "Cancel", IsCancel = true };
         var save = new Button { Content = saveLabel };
         var discard = new Button { Content = discardLabel };
@@ -115,6 +133,11 @@ public sealed partial class MainWindow
             Children = { new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap }, actions } };
         dialog.Opened += (_, _) => cancel.Focus();
         return await dialog.ShowDialog<int>(this);
+    }
+
+    private void RequireStoppedForPicker()
+    {
+        if (session.IsRunning) throw new InvalidOperationException("Stop playback before opening a file dialog.");
     }
 
     private async void OnClosing(object? sender, WindowClosingEventArgs e)
@@ -138,17 +161,18 @@ public sealed partial class MainWindow
 
     private async void HandleShortcuts(object? sender, KeyEventArgs e)
     {
-        if (documentDialog || closePending || e.Handled) return;
+        if (e.Handled) return;
         var ctrl = e.KeyModifiers.HasFlag(KeyModifiers.Control);
         var shift = e.KeyModifiers.HasFlag(KeyModifiers.Shift);
         if (e.Key == Key.F8 || ctrl && shift && e.Key == Key.Space)
         {
             e.Handled = true; Try(() => { if (e.Key == Key.F8) session.Stop(); else session.Panic(); Reload(); RefreshTakes(); }); return;
         }
+        if (documentDialog || closePending) return;
         if (e.Key == Key.F5 && e.KeyModifiers == KeyModifiers.None)
-        { e.Handled = true; Try(() => { if (session.Status().Running) session.Stop(); else StartSong(); Reload(); }); return; }
+        { e.Handled = true; Try(() => { if (session.IsRunning) session.Stop(); else StartSong(); Reload(); }); return; }
         if (!ctrl) return;
-        if (e.Key == Key.S || e.Key == Key.O && !session.Status().Running)
+        if (e.Key == Key.S || e.Key == Key.O && !session.IsRunning)
         {
             e.Handled = true; documentDialog = true;
             try { if (e.Key == Key.S) await SaveProject(shift); else await Open(); }
@@ -157,6 +181,6 @@ public sealed partial class MainWindow
             return;
         }
         if (e.Key == Key.Z && e.Source is not TextBox && e.Source is not NumericUpDown)
-        { e.Handled = true; Try(() => { if (shift) session.Redo(); else session.Undo(); ClearCandidate(); Reload(); }); }
+        { e.Handled = true; await GuardDraftChange(() => { if (shift) session.Redo(); else session.Undo(); ClearCandidate(); Reload(); }); }
     }
 }

@@ -12,6 +12,8 @@ using MidiWorkbench.Specs;
 
 var tests = new (string Name, Action Run)[]
 {
+    ("bounded take history and archive recovery", TakeHistorySpecs.Run),
+    ("scheduler timing regressions", TimingRegressionSpecs.Run),
     ("backend safety suite", BackendSafetySpecs.Run),
     ("persistence workflow regressions", PersistenceWorkflowRegressionSpecs.Run),
     ("transport regression suite", TransportRegressionSpecs.Run),

@@ -93,7 +93,10 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
     {
         if (!Running || plan is null) return;
         clock.TrimBefore(now);
-        releases.RemoveAll(r => r.Message.Seconds <= now);
+        var retained = 0;
+        for (var i = 0; i < releases.Count; i++)
+            if (releases[i].Message.Seconds > now) releases[retained++] = releases[i];
+        if (retained < releases.Count) releases.RemoveRange(retained, releases.Count - retained);
         var horizonTick = clock.TickAt(horizon);
         emittedUntil = Math.Max(emittedUntil, horizon);
         var events = plan.Events;

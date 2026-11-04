@@ -72,6 +72,12 @@ public sealed class WorkbenchSession : IDisposable
     private void EnsureOpen() { ObjectDisposedException.ThrowIf(disposed, this); }
     private readonly Stack<SongProject> undo = new(), redo = new();
     private readonly List<PerformanceTake> takes = new();
+    private readonly HashSet<PerformanceTake> savedTakes = new(ReferenceEqualityComparer.Instance);
+    public const int RecentTakeLimit = 16;
+    public const int RecentTakeEventLimit = 200_000;
+    private bool hasOlderTakes;
+    private PerformanceTake? lastArchivedTake, lastTakeSnapshot;
+    private long lastTakeSnapshotNumber;
     private long archivedTake;
     private Meter? captureMeter;
     private string? captureProjectId, captureProjectName, captureInput, captureDestination, captureEndpoint;
@@ -108,6 +114,8 @@ public sealed class WorkbenchSession : IDisposable
     public bool CanUndo { get { lock (gate) return undo.Count > 0; } }
     public bool CanRedo { get { lock (gate) return redo.Count > 0; } }
     public IReadOnlyList<PerformanceTake> Takes { get { lock (gate) return takes.ToArray(); } }
+    public bool HasOlderTakes { get { lock (gate) return hasOlderTakes; } }
+    public string? TakeDirectory => takeDirectory;
     private int SectionIndex => Array.FindIndex(project.Sections.ToArray(), s => s.Id == selectedSectionId);
     private void RequireStopped() { HandleLostInput(); if (Running) throw new InvalidOperationException("Stop playback first."); }
     private void Apply(SongProject value)
@@ -171,10 +179,18 @@ public sealed class WorkbenchSession : IDisposable
         takeDirectory = options.TakeDirectory;
         if (takeDirectory is not null)
         {
-            Directory.CreateDirectory(takeDirectory);
-            foreach (var file in Directory.EnumerateFiles(takeDirectory, "*.json").OrderBy(f => f, StringComparer.Ordinal))
-                try { takes.Add(ProjectStore.LoadTake(file)); }
-                catch (Exception ex) when (ex is IOException or ArgumentException or InvalidDataException or System.Text.Json.JsonException) { notice = $"Take not loaded: {ex.Message}"; }
+            try
+            {
+                Directory.CreateDirectory(takeDirectory);
+                var files = Directory.EnumerateFiles(takeDirectory, "*.json").OrderByDescending(f => f, StringComparer.Ordinal).ToArray();
+                hasOlderTakes = files.Length > RecentTakeLimit;
+                foreach (var file in files.Take(RecentTakeLimit).Reverse())
+                    try { RememberTake(ProjectStore.LoadTake(file), saved: true); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidDataException or System.Text.Json.JsonException)
+                    { notice = $"Take not loaded: {ex.Message}"; }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { notice = $"Take archive unavailable: {ex.Message}. Save takes to another folder."; }
         }
         project = CreateDemo();
         selectedSectionId = project.Sections[0].Id;
@@ -197,6 +213,8 @@ public sealed class WorkbenchSession : IDisposable
         project.Sections.SelectMany(s => s.Parts).Select(p => p.Destination).Append(PhraseDestination).Distinct(StringComparer.Ordinal);
     public IReadOnlyList<MidiEndpoint> Endpoints() => backend.Endpoints();
     private bool Running => host.Status.Running;
+    // Snapshot only: UI safety controls must remain usable if take archiving fails.
+    public bool IsRunning => host.Status.Running;
 
     public Section PrepareGeneration(Outline outline, DrummerSettings? drummer = null, bool basicDrums = false) =>
         PrepareGenerationAsync(outline, drummer, basicDrums).GetAwaiter().GetResult();
@@ -515,6 +533,7 @@ public sealed class WorkbenchSession : IDisposable
     }
     private void SnapshotCaptureSource()
     {
+        EnsureTakeHistoryCapacity();
         HandleLostInput();
         if (rig.Input is not null && input is null)
         {
@@ -670,7 +689,7 @@ public sealed class WorkbenchSession : IDisposable
                 catch (Exception ex) when (ex is InvalidOperationException or ArgumentException) { notice = ex.Message; }
             }
             if (!s.Running && s.Take > archivedTake) ArchiveTake();
-            return new(s.Running, s.Tick, s.Captured, s.CaptureComplete, s.LateNoteOns, s.SkippedClocks, s.DroppedInputs, notice ?? s.Error, revision)
+            return new(s.Running, s.Tick, s.Captured, s.CaptureComplete, s.LateNoteOns, s.SkippedClocks, s.DroppedInputs, s.Error ?? notice, revision)
                 { PlayingSection = PlayingSectionFor(s),
                     QueuedSection = s.Running && s.QueuedPlanTag is { } tag && planSections.TryGetValue(tag, out var queued) ? queued : null };
         }
@@ -828,7 +847,12 @@ public sealed class WorkbenchSession : IDisposable
             capture = host.Capture(); inputId = captureInput;
         }
         if (capture.Take == 0) throw new InvalidOperationException("Play a section before saving a take.");
-        lock (gate) return CaptureTake(capture, inputId);
+        lock (gate)
+        {
+            if (capture.Take == archivedTake && lastArchivedTake is not null) return lastArchivedTake;
+            lastTakeSnapshot = CaptureTake(capture, inputId); lastTakeSnapshotNumber = capture.Take;
+            return lastTakeSnapshot;
+        }
     }
     private PerformanceTake CaptureTake(TransportCapture capture, string? inputId)
     {
@@ -846,12 +870,32 @@ public sealed class WorkbenchSession : IDisposable
         {
             var take = CaptureTake(capture, captureInput);
             if (takeDirectory is not null) ProjectStore.SaveTake(Path.Combine(takeDirectory, $"{take.StartedAt:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}.json"), take);
-            takes.Add(take); archivedTake = capture.Take;
+            RememberTake(take, saved: takeDirectory is not null); lastArchivedTake = take; archivedTake = capture.Take;
         }
+    }
+    private static int TakeEvents(PerformanceTake take) => take.Outputs.Length + take.Inputs.Length;
+    private void RememberTake(PerformanceTake take, bool saved)
+    {
+        if (!takes.Any(t => ReferenceEquals(t, take))) takes.Add(take);
+        if (saved) savedTakes.Add(take);
+        var events = takes.Sum(TakeEvents);
+        while (takes.Count > RecentTakeLimit || events > RecentTakeEventLimit && takes.Count > 1)
+        {
+            // Only evict copies with a known JSON file. Never discard an unsaved recording.
+            var index = takes.FindIndex(0, takes.Count - 1, t => savedTakes.Contains(t));
+            if (index < 0) break;
+            var old = takes[index]; events -= TakeEvents(old); takes.RemoveAt(index); savedTakes.Remove(old); hasOlderTakes = true;
+        }
+    }
+    private void EnsureTakeHistoryCapacity()
+    {
+        var unsaved = takes.Where(t => !savedTakes.Contains(t)).ToArray();
+        if (unsaved.Length >= RecentTakeLimit || unsaved.Sum(TakeEvents) >= RecentTakeEventLimit)
+            throw new InvalidOperationException("Recent unsaved takes are full. Save selected takes as JSON before starting another performance.");
     }
     public PerformanceTake LoadTake(string path)
     {
-        var take = ProjectStore.LoadTake(path); lock (gate) { takes.Add(take); return take; }
+        var take = ProjectStore.LoadTake(path); lock (gate) { RememberTake(take, saved: true); return take; }
     }
     public void ReplayTake(PerformanceTake take) => PlayTake(take);
     public void ReplayTake(PerformanceTake take, IReadOnlyDictionary<string, string> endpointDestinations) => PlayTake(take, endpointDestinations);
@@ -862,6 +906,7 @@ public sealed class WorkbenchSession : IDisposable
         lock (gate)
         {
             RequireStopped(); CommitRecording(); ArchiveTake();
+            EnsureTakeHistoryCapacity();
             var events = new List<PlannedMessage>();
             var realtime = new List<(int Order, long Tick, string Endpoint, byte Status, byte Data1, byte Data2)>();
             var musicalOrder = new List<int>();
@@ -952,10 +997,22 @@ public sealed class WorkbenchSession : IDisposable
             capture.Actions, capture.TempoChanges);
     }
     // .mid writes a Standard MIDI File; anything else writes the JSON take.
-    public void SaveTake(string path)
+    public void SaveTake(string path) => SaveTake(path, Take());
+    public void SaveTake(string path, PerformanceTake take)
     {
-        var take = Take();
-        if (!path.EndsWith(".mid", StringComparison.OrdinalIgnoreCase)) { ProjectStore.SaveTake(path, take); return; }
+        if (!path.EndsWith(".mid", StringComparison.OrdinalIgnoreCase))
+        {
+            ProjectStore.SaveTake(path, take);
+            lock (gate)
+            {
+                RememberTake(take, saved: true);
+                // An explicit JSON save is a recovery route when the automatic archive is full/unwritable.
+                if (!host.Status.Running && ReferenceEquals(take, lastTakeSnapshot) && lastTakeSnapshotNumber == host.Status.Take)
+                { archivedTake = lastTakeSnapshotNumber; lastArchivedTake = take; }
+            }
+            return;
+        }
+        ProjectStore.ValidateTake(take);
         var map = new TempoMap(take.Bpm, take.TempoChanges);
         ProjectStore.WriteAtomic(path, MidiFile.FromTake(take, take.Meter ?? SelectedSection.Outline.Meter, map.TickAt, map.Changes));
     }

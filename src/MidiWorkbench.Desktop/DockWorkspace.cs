@@ -1,6 +1,8 @@
 using Avalonia.Controls;
 using Avalonia.Controls.Templates;
 using Avalonia.Layout;
+using Avalonia.Input;
+using Avalonia.Interactivity;
 using Dock.Avalonia.Controls;
 using Dock.Model.Core;
 using Dock.Model.Controls;
@@ -96,6 +98,12 @@ internal sealed class DockWorkspace : ContentControl, IDisposable
         if (host.Layout is not IRootDock root) return;
         var document = Walk(root).OfType<Document>().FirstOrDefault(d => d.Id == id);
         if (document?.Owner is IDock owner) { owner.ActiveDockable = document; factory.SetActiveDockable(document); }
+    }
+    public void AttachShortcuts(EventHandler<KeyEventArgs> handler)
+    {
+        // Pane roots travel with their contents when floated. On the main window the
+        // tunnel handler runs first and marks the event handled, so it is not repeated.
+        foreach (var view in views.Values) view.AddHandler(InputElement.KeyDownEvent, handler, RoutingStrategies.Tunnel);
     }
     private void CloseFloating()
     {

@@ -18,6 +18,7 @@ internal sealed class GeneratorPane : StackPanel
     private readonly CheckBox source = new() { Content = "Use part notes" };
     private readonly Button preview = new() { Content = "Preview part" };
     private readonly Dictionary<Control, Control> fields = new();
+    private string? loadedDraft;
     public Func<GeneratorSettings, Task>? Prepare { get; set; }
     public bool IsPreparing { set => preview.IsEnabled = !value; }
     public event Action<Exception>? Error;
@@ -50,6 +51,10 @@ internal sealed class GeneratorPane : StackPanel
         };
     }
     public bool UseSource => kind.SelectedItem is GeneratorKind.Arpeggiator && source.IsChecked == true;
+    private string Draft() => System.Text.Json.JsonSerializer.Serialize(new object?[] { kind.SelectedItem, seed.Value, steps.Value, stepTicks.Value,
+        degrees.Text, enabled.Text, gate.Value, velocity.Value, spread.Value, probability.Value, ratchet.Value, swing.Value, minPitch.Value, maxPitch.Value,
+        pulses.Value, rotation.Value, walk.Value, direction.SelectedItem, octaves.Value, chord.Text, progression.Text, groups.Text, source.IsChecked });
+    public bool HasDraft => loadedDraft is not null && loadedDraft != Draft();
     private static NumericUpDown N(decimal min, decimal max, decimal value) => new() { Minimum = min, Maximum = max, Value = value, MinWidth = 100 };
     private static Slider A(double value, double min, double max) => new() { Minimum = min, Maximum = max, Value = value, MinWidth = 130 };
     private void Add(string label, Control control)
@@ -99,5 +104,6 @@ internal sealed class GeneratorPane : StackPanel
         pulses.Value = s.Pulses; rotation.Value = s.Rotation; walk.Value = s.WalkStep; direction.SelectedItem = s.Direction;
         octaves.Value = s.Octaves; chord.Text = string.Join(',', s.ChordDegrees); progression.Text = string.Join(',', s.Progression);
         groups.Text = string.Join(',', s.Grouping); source.IsChecked = !s.SourceNotes.IsEmpty;
+        loadedDraft = Draft();
     }
 }
