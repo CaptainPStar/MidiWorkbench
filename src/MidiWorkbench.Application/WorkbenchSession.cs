@@ -15,6 +15,7 @@ public sealed record SessionStatus(bool Running, double Tick, int CapturedEvents
 }
 public enum GenerationPhase { Idle, Preparing, Ready, Cancelled, Failed }
 public enum AuditionPhase { Idle, Queued, Playing, Returning }
+public enum ExportChannelMode { ProjectChannels, RoutingOverrides }
 public sealed record AuditionProgress(AuditionPhase Phase, string? SectionId = null);
 public sealed record GenerationProgress(long RequestId, GenerationPhase Phase, string? SectionId = null, string? Error = null);
 public sealed record SessionOptions(IMidiBackend? Backend = null, string? RigPath = null, HostOptions? Host = null, string? TakeDirectory = null);
@@ -848,6 +849,27 @@ public sealed class WorkbenchSession : IDisposable
         lock (gate) { if (!Running) CommitRecording(); snapshot = project; }
         ProjectStore.Save(path, snapshot);
     }
+    public void NewProject(string name = "Untitled")
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Enter a project name.", nameof(name));
+        var roles = new[] { PartRole.Drums, PartRole.Bass, PartRole.Pulse, PartRole.Pad };
+        var parts = roles.Select(role =>
+        {
+            var id = role.ToString().ToLowerInvariant();
+            return new Part(id, role.ToString(), role, role.ToString(), role == PartRole.Drums ? 10 : (int)role,
+                new Pattern(id, PatternKind.Generative, []));
+        }).ToImmutableArray();
+        var outline = new Outline("Opening", 4, new Meter(4, 4), 48, [0, 2, 4, 5, 7, 9, 11], .5, .5, .25, 1);
+        var value = new SongProject(SongProject.CurrentSchemaVersion, name.Trim(), 120,
+            [new Section("section-" + Guid.NewGuid().ToString("N"), outline, parts)]);
+        value.Validate();
+        lock (gate)
+        {
+            EnsureOpen(); RequireStopped(); CommitRecording(); ArchiveTake(); Await(host.Arm(null, 1));
+            project = value; selectedSectionId = value.Sections[0].Id; armed = null;
+            undo.Clear(); redo.Clear(); InvalidateGeneration(); ResetAudition(); revision++;
+        }
+    }
     public void Load(string path)
     {
         var value = ProjectStore.Load(path);
@@ -858,13 +880,25 @@ public sealed class WorkbenchSession : IDisposable
             project = value; selectedSectionId = value.Sections[0].Id; armed = null; undo.Clear(); redo.Clear(); InvalidateGeneration(); revision++;
         }
     }
-    public void ExportMidi(string path)
+    private static Dictionary<string, int> ExportOverrides(ExportChannelMode channelMode, Rig channelRig)
     {
-        var p = Project; ProjectStore.WriteAtomic(path, MidiFile.FromSection(p.Sections.First(s => s.Id == SelectedSectionId), p.Bpm));
+        if (!Enum.IsDefined(channelMode)) throw new ArgumentOutOfRangeException(nameof(channelMode));
+        if (channelMode == ExportChannelMode.ProjectChannels) return new(StringComparer.Ordinal);
+        channelRig.Validate();
+        return channelRig.Routes.Where(r => r.Channel is not null).ToDictionary(r => r.Destination, r => r.Channel!.Value, StringComparer.Ordinal);
     }
-    public void ExportArrangementMidi(string path)
+    public void ExportMidi(string path, ExportChannelMode channelMode = ExportChannelMode.ProjectChannels, Rig? exportRig = null)
     {
-        SongProject snapshot; lock (gate) snapshot = project;
+        SongProject snapshot; Section section; Rig channelRig;
+        lock (gate) { if (!Running) CommitRecording(); snapshot = project; section = project.Sections[SectionIndex]; channelRig = exportRig ?? rig; }
+        var channels = ExportOverrides(channelMode, channelRig);
+        if (channels.Count != 0) section = section with { Parts = section.Parts.Select(p => channels.TryGetValue(p.Destination, out var channel) ? p with { Channel = channel } : p).ToImmutableArray() };
+        ProjectStore.WriteAtomic(path, MidiFile.FromSection(section, snapshot.Bpm));
+    }
+    public void ExportArrangementMidi(string path, ExportChannelMode channelMode = ExportChannelMode.ProjectChannels, Rig? exportRig = null)
+    {
+        SongProject snapshot; Rig channelRig; lock (gate) { if (!Running) CommitRecording(); snapshot = project; channelRig = exportRig ?? rig; }
+        var channels = ExportOverrides(channelMode, channelRig);
         var plan = ArrangementCompiler.Compile(snapshot);
         var entries = snapshot.Arrangement.IsEmpty ? snapshot.Sections.Select(s => new ArrangementEntry(s.Id)) : snapshot.Arrangement;
         var lookup = snapshot.Sections.ToDictionary(s => s.Id, StringComparer.Ordinal);
@@ -877,7 +911,8 @@ public sealed class WorkbenchSession : IDisposable
             offset = checked(offset + section.Outline.LengthTicks);
         }
         var tracks = plan.Events.GroupBy(e => e.Destination).Select(g => new SmfTrack(g.Key,
-            g.Select(e => new SmfEvent(e.Tick, e.Status, e.Data1, e.Data2)).ToArray())).ToArray();
+            g.Select(e => new SmfEvent(e.Tick, e.Status < 0xF0 && channels.TryGetValue(e.Destination, out var channel)
+                ? (byte)((e.Status & 0xF0) | (channel - 1)) : e.Status, e.Data1, e.Data2)).ToArray())).ToArray();
         ProjectStore.WriteAtomic(path, MidiFile.Build(meters, [(0, snapshot.Bpm)], tracks, plan.LengthTicks));
     }
     public PerformanceTake Take()

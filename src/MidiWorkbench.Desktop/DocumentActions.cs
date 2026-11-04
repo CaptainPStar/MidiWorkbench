@@ -19,6 +19,31 @@ public sealed partial class MainWindow
     private bool ProjectChanged => !ReferenceEquals(savedProject, session.Project);
     private bool BankChanged => session.Bank is not null && !ReferenceEquals(savedBank, session.Bank);
 
+    private sealed record MidiExportOptions(bool SongOrder, bool CurrentRouting);
+
+    private async Task<MidiExportOptions?> ChooseMidiExport()
+    {
+        var dialog = new Window { Title = "Export MIDI", Width = 420, SizeToContent = SizeToContent.Height, CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, ShowInTaskbar = false };
+        dialog.AddHandler(KeyDownEvent, HandleShortcuts, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        var scope = new ComboBox { ItemsSource = new[] { "Song order", "Selected section" }, SelectedIndex = 0, HorizontalAlignment = HorizontalAlignment.Stretch };
+        var channels = new ComboBox { ItemsSource = new[] { "Current routing channels", "Stored project channels" }, SelectedIndex = 0, HorizontalAlignment = HorizontalAlignment.Stretch };
+        Avalonia.Automation.AutomationProperties.SetName(scope, "Export scope");
+        Avalonia.Automation.AutomationProperties.SetName(channels, "Export channels");
+        ToolTip.SetTip(channels, "Current routing uses channel overrides where set, otherwise part channels. Endpoint availability and delay do not affect the MIDI file.");
+        var cancel = new Button { Content = "Cancel", IsCancel = true };
+        var confirm = new Button { Content = "Choose file", IsDefault = true };
+        cancel.Click += (_, _) => dialog.Close(null);
+        confirm.Click += (_, _) => dialog.Close(new MidiExportOptions(scope.SelectedIndex == 0, channels.SelectedIndex == 0));
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, HorizontalAlignment = HorizontalAlignment.Right, Children = { cancel, confirm } };
+        dialog.Content = new StackPanel { Margin = new Thickness(20), Spacing = 12, Children =
+        {
+            new TextBlock { Text = "Export" }, scope, new TextBlock { Text = "Channels" }, channels, buttons
+        } };
+        dialog.Opened += (_, _) => scope.Focus();
+        return await dialog.ShowDialog<MidiExportOptions?>(this);
+    }
+
     private void StartSong()
     {
         playback = session.Armed is null ? "song" : "section";
@@ -28,6 +53,29 @@ public sealed partial class MainWindow
     }
 
     private void RefreshDocumentTitle() => Title = $"{(ProjectChanged ? "* " : "")}{session.Project.Name}{(projectPath is null ? "" : $" ({Path.GetFileName(projectPath)})")} — MidiWorkbench{(BankChanged ? " · Bank unsaved" : "")}";
+
+    private async Task NewSong()
+    {
+        if (session.IsRunning) throw new InvalidOperationException("Stop playback before starting a new song.");
+        // Commit and archive a naturally finished take before checking whether
+        // the current project needs saving. Failure leaves it available to recover.
+        session.Stop(); Reload();
+        var name = await AskName("New song", "Untitled", "Create");
+        if (name is null || !await ConfirmProjectReplacement()) return;
+        session.NewProject(name);
+        savedProject = null; projectPath = null; candidate = null; currentPart = null;
+        loadedOutline = null; loadedGeneratorSettings = null; loadedDrummer = null;
+        var wasLoading = loading; loading = true;
+        try
+        {
+            drummer.SelectedIndex = 1; ShowDrummer(MidiWorkbench.Generation.DrumPersonas.All[0].Id, null);
+            pitch.Value = 60; velocity.Value = 90; tick.Value = 1; duration.Value = .25m; locked.IsChecked = true;
+            snap.SelectedIndex = 2; loop.IsChecked = false;
+        }
+        finally { loading = wasLoading; }
+        playback = "song"; auditionSection = null; replayingTake = null;
+        Reload(); status.Text = $"New song: {session.Project.Name}";
+    }
 
     private async Task RenameSong()
     {

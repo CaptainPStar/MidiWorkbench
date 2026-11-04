@@ -34,6 +34,23 @@ internal static class Program
             AppBuilder.Configure<WorkbenchApp>().UseSkia()
                 .UseHeadless(new AvaloniaHeadlessPlatformOptions { UseHeadlessDrawing = false }).SetupWithoutStarting();
             window = new MainWindow(); window.Show(); Pump();
+            if (args.Contains("--export-choice-only"))
+            {
+                CheckMidiExportChoice(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            if (args.Contains("--framing-only") || args.Contains("--framing-group-only"))
+            {
+                CheckChordFraming(args.Contains("--framing-group-only")); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
+            if (args.Contains("--new-song-only"))
+            {
+                CheckNewSongWorkflow(); SetField("closing", true); window.Close(); Pump();
+                window = new MainWindow(); window.Show(); Pump(); CheckNaturalCompletionNewSong();
+                File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
+                SetField("closing", true); window.Close(); Pump(); return 0;
+            }
             if (args.Contains("--vary-only"))
             {
                 CheckVariationSeedFlows(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
@@ -70,6 +87,18 @@ internal static class Program
                 CheckSectionRename(); File.WriteAllLines(Path.Combine(evidence, "results.txt"), Results);
                 SetField("closing", true); window.Close(); Pump(); return 0;
             }
+            CheckMidiExportChoice();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckChordFraming();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckNewSongWorkflow();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
+            CheckNaturalCompletionNewSong();
+            SetField("closing", true); window.Close(); Pump();
+            window = new MainWindow(); window.Show(); Pump();
             CheckVariationSeedFlows();
             SetField("closing", true); window.Close(); Pump();
             window = new MainWindow(); window.Show(); Pump();
@@ -278,6 +307,241 @@ internal static class Program
         Click("Apply");
         var edited = session.SelectedSection.Parts[0].Pattern.Notes.Single(n => n.Id == "beat-precision-319");
         Check(edited.Tick == 240 && edited.Duration == 240, "Quarter-beat field edits commit 240 ticks");
+    }
+    private static IReadOnlyList<(long Tick, int Channel, int Pitch, int Velocity)> ReadMidiAttacks(string path)
+    {
+        var bytes = File.ReadAllBytes(path); var position = 0;
+        int Number(int count) { var value = 0; for (var i = 0; i < count; i++) value = checked((value << 8) | bytes[position++]); return value; }
+        string Tag() { var value = System.Text.Encoding.ASCII.GetString(bytes, position, 4); position += 4; return value; }
+        long Variable() { long value = 0; for (var i = 0; i < 4; i++) { var b = bytes[position++]; value = (value << 7) | (uint)(b & 127); if (b < 128) return value; } throw new InvalidDataException("Invalid MIDI variable integer"); }
+        if (Tag() != "MThd" || Number(4) != 6 || Number(2) != 1) throw new InvalidDataException("Invalid MIDI header");
+        var count = Number(2); if (Number(2) != 960) throw new InvalidDataException("Unexpected MIDI resolution");
+        var attacks = new List<(long, int, int, int)>();
+        for (var track = 0; track < count; track++)
+        {
+            if (Tag() != "MTrk") throw new InvalidDataException("Missing MIDI track");
+            var length = Number(4); var end = checked(position + length); long tick = 0; var running = -1;
+            while (position < end)
+            {
+                tick += Variable(); var status = bytes[position];
+                if (status >= 128) { position++; running = status < 0xF0 ? status : -1; }
+                else if (running >= 0) status = (byte)running;
+                else throw new InvalidDataException("Invalid running status");
+                if (status == 0xFF) { position++; var size = checked((int)Variable()); position += size; }
+                else if (status is 0xF0 or 0xF7) { var size = checked((int)Variable()); position += size; }
+                else
+                {
+                    var kind = status & 0xF0; var a = bytes[position++]; var b = kind is 0xC0 or 0xD0 ? 0 : bytes[position++];
+                    if (kind == 0x90 && b > 0) attacks.Add((tick, (status & 15) + 1, a, b));
+                }
+            }
+            if (position != end) throw new InvalidDataException("MIDI track length mismatch");
+        }
+        return attacks;
+    }
+    private static void CheckMidiExportChoice()
+    {
+        var session = Field<WorkbenchSession>("session"); var old = session.SelectedSection; var originalRig = session.Rig;
+        var outline = old.Outline with { Bars = 1 };
+        var part = new Part("export-lead", "Lead", PartRole.Phrase, "Lead", 2,
+            new Pattern("export-pattern", PatternKind.Fixed, [new MidiNote("export-note", 240, 240, 64, 90)]));
+        var section = old with { Outline = outline, Parts = [part] };
+        var project = session.Project with { Sections = [section], Arrangement = [new(section.Id, 2)] };
+        typeof(WorkbenchSession).GetMethod("Apply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(session, [project]);
+        session.SetRig(new Rig(Rig.CurrentSchemaVersion, [new("offline-device", false, 35)], [new("Lead", "offline-device", 7)])); Invoke("Reload"); Pump();
+        var baseline = session.Project; var rig = session.Rig; var output = "";
+        SetField("midiExportPicker", (Func<string, Task<string?>>)(_ => Task.FromResult<string?>(output)));
+        void Open() { Click("Export MIDI"); Pump(); }
+        Window Dialog() => window.OwnedWindows.Single(w => w.Title == "Export MIDI");
+        ComboBox NamedCombo(Window dialog, string name) => dialog.GetVisualDescendants().OfType<ComboBox>().Single(c => AutomationProperties.GetName(c) == name);
+        Open(); var initial = Dialog();
+        var scope = NamedCombo(initial, "Export scope"); var channels = NamedCombo(initial, "Export channels");
+        Check(scope.SelectedIndex == 0 && scope.SelectedItem!.ToString() == "Song order"
+            && channels.SelectedIndex == 0 && channels.SelectedItem!.ToString() == "Current routing channels", "Export defaults to song order and current routing channels");
+        Check((ToolTip.GetTip(channels)?.ToString() ?? "").Contains("availability and delay"), "Export help explains channel fallback and excludes endpoint availability and delay");
+        using (var frame = initial.CaptureRenderedFrame()) frame!.Save(Path.Combine(evidence, "export-options-dialog.png"), PngBitmapEncoderOptions.Default);
+        Click(initial, "Cancel"); Pump(); Check(!window.OwnedWindows.Any(w => w.Title == "Export MIDI"), "Cancelling export closes without writing a file");
+        void ExportAndCheck(string file, int selectedScope, int selectedChannels, int channel, int count)
+        {
+            output = Path.Combine(evidence, file); Open(); var dialog = Dialog();
+            NamedCombo(dialog, "Export scope").SelectedIndex = selectedScope; NamedCombo(dialog, "Export channels").SelectedIndex = selectedChannels;
+            Click(dialog, "Choose file"); Until(() => File.Exists(output));
+            var attacks = ReadMidiAttacks(output);
+            Check(attacks.Count == count && attacks.All(a => a.Channel == channel && a.Pitch == 64 && a.Velocity == 90)
+                && attacks.Select(a => a.Tick).SequenceEqual(count == 2 ? [240L, 4080L] : [240L]),
+                $"{(selectedScope == 0 ? "Song" : "Section")} export uses {(selectedChannels == 0 ? "routing" : "project")} channels without shifting notes");
+        }
+        ExportAndCheck("song-routing.mid", 0, 0, 7, 2); ExportAndCheck("song-stored.mid", 0, 1, 2, 2);
+        ExportAndCheck("section-routing.mid", 1, 0, 7, 1); ExportAndCheck("section-stored.mid", 1, 1, 2, 1);
+        Check(ReferenceEquals(session.Project, baseline) && ReferenceEquals(session.Rig, rig), "Export choices do not change the project or rig");
+        typeof(MainWindow).GetField("midiExportPicker", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(window, null);
+        // Rig settings persist between windows; do not leak this offline fixture
+        // into subsequent tests that launch the ordinary four-part project.
+        session.SetRig(originalRig);
+    }
+    private static void CheckChordFraming(bool skipMaterialAssertion = false)
+    {
+        var session = Field<WorkbenchSession>("session"); var section = session.SelectedSection;
+        var project = session.Project with { Sections = session.Project.Sections.SetItem(0, section with { Outline = section.Outline with { Density = 1 } }) };
+        typeof(WorkbenchSession).GetMethod("Apply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(session, [project]); Invoke("Reload"); Pump();
+        var parts = Field<ComboBox>("parts"); parts.SelectedItem = parts.ItemsSource!.Cast<object>().Single(item => item.ToString() == "Pad"); Pump();
+        var roll = Field<Control>("roll"); var rollType = roll.GetType(); var scroll = Field<ScrollViewer>("rollScroll");
+        var generator = Field<Control>("generators"); var genType = generator.GetType();
+        T Member<T>(string name) => (T)genType.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        Member<ComboBox>("kind").SelectedItem = GeneratorKind.Pad;
+        Member<NumericUpDown>("minPitch").Value = 72; Member<NumericUpDown>("maxPitch").Value = 96;
+        rollType.GetMethod("Select")!.Invoke(roll, [null]);
+        scroll.Offset = new Vector(0, 26 + (127 - 76) * 22 - 40); Pump();
+        Member<Button>("preview").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        Until(() => session.Candidate is not null || session.GenerationStatus.Phase == GenerationPhase.Failed);
+        var candidate = session.Candidate ?? throw new InvalidOperationException($"Pad preview failed: {session.GenerationStatus.Error}");
+        var notes = candidate.Parts.Single(p => p.Role == PartRole.Pad).Pattern.Notes.Where(n => n.Tick == 0).ToArray();
+        Check(notes.Length == 3, "High-register Pad preview produces a triad");
+        bool AllRowsVisible(IEnumerable<MidiNote> selected) => selected.All(note =>
+        {
+            var rect = (Rect)rollType.GetMethod("NoteRect", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(roll, [note])!;
+            return rect.Top >= scroll.Offset.Y + 26 - 1 && rect.Bottom <= scroll.Offset.Y + scroll.Viewport.Height + 1;
+        });
+        if (!skipMaterialAssertion) Check(AllRowsVisible(notes), "Generated high-register triad is fully visible when its pitch span fits");
+        Capture("chord-preview-1380x900", 1380, 900);
+        Field<Button>("accept").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        rollType.GetMethod("SelectMany")!.Invoke(roll, [notes.Select(n => n.Id).ToArray(), notes[0].Id]); Pump();
+        Field<NumericUpDown>("pitch").Value = notes[0].Pitch + 12;
+        Click("Apply"); Pump();
+        var moved = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Pad).Pattern.Notes.Where(n => notes.Any(old => old.Id == n.Id)).ToArray();
+        Check(moved.Length == 3 && moved.All(n => notes.Any(old => old.Id == n.Id && n.Pitch == old.Pitch + 12)), "Group-field Apply transposes all three selected voices");
+        Check(AllRowsVisible(moved), "Group-field transpose reveals every selected voice when its pitch span fits");
+        Capture("chord-transpose-1380x900", 1380, 900);
+        var pad = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Pad);
+        var low = new MidiNote("wide-low", 0, 240, 24, 90); var high = new MidiNote("wide-high", 0, 240, 120, 90);
+        session.EditNotes(pad.Id, [low, high], []); Invoke("Reload"); Pump();
+        rollType.GetMethod("SelectMany")!.Invoke(roll, [new[] { low.Id, high.Id }, low.Id]); Pump();
+        Field<NumericUpDown>("pitch").Value = 25; Click("Apply"); Pump();
+        var movedLow = session.SelectedSection.Parts.Single(p => p.Role == PartRole.Pad).Pattern.Notes.Single(n => n.Id == low.Id);
+        Check(movedLow.Pitch == 25 && AllRowsVisible([movedLow]), "A group wider than the viewport falls back to its primary note");
+    }
+    private static void CheckNewSongWorkflow()
+    {
+        var session = Field<WorkbenchSession>("session");
+        session.NewBank("Retained set"); session.AddCurrentToBank();
+        session.SetRig(session.Rig with { Input = "loopback" }); var rig = session.Rig; var bank = session.Bank;
+        session.StartSection(repeat: true); Thread.Sleep(80); session.Stop(); var takeCount = session.Takes.Count;
+        var oldPath = Path.Combine(evidence, "old-song.midiwork.json"); session.Save(oldPath);
+        SetField("savedProject", session.Project); SetField("projectPath", oldPath);
+        var oldId = session.Project.Id;
+        var oldPart = session.SelectedSection.Parts.First(); var oldNote = new MidiNote("new-song-old-note", 0, 120, 50, 90, true);
+        session.EditNotes(oldPart.Id, [oldNote], []); Invoke("Reload"); Pump();
+        var newButton = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "New song"));
+        void StartNew() { newButton.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump(); }
+        Window Dialog(string title) => window.OwnedWindows.Single(w => w.Title == title);
+        void Enter(string value)
+        {
+            var dialog = Dialog("New song"); dialog.GetVisualDescendants().OfType<TextBox>().Single().Text = value;
+            dialog.KeyPress(Key.Enter, RawInputModifiers.None, PhysicalKey.None, null);
+            if (dialog.IsVisible) dialog.KeyRelease(Key.Enter, RawInputModifiers.None, PhysicalKey.None, null); Pump();
+        }
+        session.StartSection(repeat: true); Until(() => session.IsRunning);
+        Check(!newButton.IsEffectivelyEnabled, "New song is disabled while playback is running");
+        StartNew(); Check(!window.OwnedWindows.Any(w => w.Title == "New song") && session.Project.Id == oldId, "New song cannot open during playback");
+        session.Stop(); Invoke("Reload"); Pump();
+        Field<NumericUpDown>("pitch").Value = 91; Field<NumericUpDown>("velocity").Value = 47;
+        Field<NumericUpDown>("tick").Value = 30; Field<NumericUpDown>("duration").Value = 2;
+        Field<CheckBox>("locked").IsChecked = false; Field<ComboBox>("snap").SelectedIndex = 3; Field<CheckBox>("loop").IsChecked = true;
+        Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Until(() => session.Candidate is not null);
+        var preview = session.Candidate; var density = Field<Slider>("density"); density.Value = .91;
+        var generator = Field<Control>("generators"); var genType = generator.GetType();
+        var genSeed = (NumericUpDown)genType.GetField("seed", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(generator)!;
+        genSeed.Value = (genSeed.Value ?? 0) + 11; var draftSeed = genSeed.Value;
+        Field<Slider>("complexity").Value = .89;
+        StartNew(); Enter("  ");
+        Check(Dialog("New song").IsVisible && session.Project.Id == oldId, "Blank New song name is rejected");
+        Click(Dialog("New song"), "Cancel"); Pump();
+        Check(session.Project.Id == oldId && ReferenceEquals(session.Candidate, preview) && density.Value == .91 && genSeed.Value == draftSeed,
+            "Cancelling New song name preserves project, preview and drafts");
+        StartNew(); Enter("Fresh Study"); Click(Dialog("Unsaved project"), "Cancel"); Pump();
+        Check(session.Project.Id == oldId && ReferenceEquals(session.Candidate, preview) && density.Value == .91,
+            "Cancelling the unsaved-project confirmation preserves the old project and preview");
+        StartNew(); Enter("Fresh Study"); Click(Dialog("Unsaved project"), "Save"); Pump();
+        Check(ProjectStore.Load(oldPath).Sections.SelectMany(s => s.Parts).SelectMany(p => p.Pattern.Notes).Any(n => n.Id == oldNote.Id),
+            "Saving on replacement confirmation writes the old project to its existing path");
+        Click(Dialog("Unaccepted changes"), "Cancel"); Pump();
+        Check(session.Project.Id == oldId && ReferenceEquals(session.Candidate, preview), "Cancelling draft discard after Save keeps the old project and preview");
+        StartNew(); Enter(" Fresh Study "); Click(Dialog("Unaccepted changes"), "Discard preview"); Pump();
+        var fresh = session.Project; var freshId = fresh.Id;
+        Check(freshId != oldId && fresh.Name == "Fresh Study" && Field<string?>("projectPath") is null && window.Title!.StartsWith("* Fresh Study", StringComparison.Ordinal),
+            "New song has a fresh identity, trimmed name, no path and an unsaved indicator");
+        Check(fresh.Bpm == 120 && fresh.Sections.Length == 1 && fresh.Sections[0].Outline is { Bars: 4, Root: 48 }
+            && fresh.Sections[0].Outline.Meter is { Numerator: 4, Denominator: 4 }
+            && fresh.Sections[0].Outline.Scale.SequenceEqual([0, 2, 4, 5, 7, 9, 11])
+            && fresh.Sections[0].Parts.Length == 4 && fresh.Sections[0].Parts.All(p => p.Pattern.Kind == PatternKind.Generative && p.Pattern.Notes.IsEmpty),
+            "New song starts as an empty four-part C-major project");
+        Check(!session.IsRunning && session.Armed is null && !session.CanUndo && !session.CanRedo && session.Candidate is null
+            && !(bool)typeof(MainWindow).GetMethod("HasUnacceptedChanges", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(window, null)!,
+            "New song clears transport, history, candidate and unapplied drafts");
+        Check(ReferenceEquals(session.Rig, rig) && ReferenceEquals(session.Bank, bank) && session.Takes.Count >= takeCount,
+            "New song retains the rig, bank and take history");
+        Check(density.Value == fresh.Sections[0].Outline.Density && !(bool)genType.GetProperty("HasDraft")!.GetValue(generator)!
+            && Field<CheckBox>("locked").IsChecked == true && Field<NumericUpDown>("pitch").Value == 60
+            && Field<NumericUpDown>("velocity").Value == 90 && Field<NumericUpDown>("tick").Value == 1
+            && Field<NumericUpDown>("duration").Value == .25m && Field<ComboBox>("snap").SelectedIndex == 2
+            && Field<CheckBox>("loop").IsChecked == false && Field<Control>("roll").GetType().GetProperty("SelectedId")!.GetValue(Field<Control>("roll")) is null,
+            "New song resets visible musical and manual-note defaults");
+        Field<NumericUpDown>("pitch").Value = 60; Click("Add note");
+        var newNote = session.SelectedSection.Parts.SelectMany(p => p.Pattern.Notes).Single();
+        Field<Button>("prepareSection").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Until(() => session.Candidate is not null);
+        Field<Button>("accept").RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        Check(session.SelectedSection.Parts.SelectMany(p => p.Pattern.Notes).Any(n => n.Id == newNote.Id && n.Locked),
+            "A new song can be edited and generated while retaining a locked note");
+        var newPath = Path.Combine(evidence, "fresh-song.midiwork.json"); SetField("projectPath", newPath); SendKey(Key.S, KeyModifiers.Control); Until(() => File.Exists(newPath));
+        session.Load(newPath); Invoke("Reload"); Pump();
+        Check(session.Project.Id == freshId && session.Project.Name == "Fresh Study" && session.SelectedSection.Parts.SelectMany(p => p.Pattern.Notes).Any(n => n.Id == newNote.Id),
+            "Saving and reopening the new song preserve its identity and edits");
+        Capture("new-song-toolbar-1000x650", 1000, 650);
+    }
+    private static void CheckNaturalCompletionNewSong()
+    {
+        var session = Field<WorkbenchSession>("session");
+        var oldSection = session.SelectedSection;
+        var shortSection = new MidiWorkbench.Generation.SectionGenerator().Generate(oldSection.Outline with { Bars = 1 }, oldSection);
+        typeof(WorkbenchSession).GetMethod("Apply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(session,
+            [session.Project with { Bpm = 400, Sections = [shortSection] }]);
+        session.SetRig(session.Rig with { Input = "loopback" });
+        var path = Path.Combine(evidence, "natural-completion-old.midiwork.json"); session.Save(path); SetField("savedProject", session.Project); SetField("projectPath", path);
+        var oldId = session.Project.Id; session.Arm(WorkbenchSession.NewPhrase); session.StartSection();
+        var backend = (MidiWorkbench.Engine.IMidiBackend)typeof(WorkbenchSession).GetField("backend", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(session)!;
+        using (var keys = backend.OpenOutput("loopback"))
+        {
+            keys.Submit(new(0, 0x90, 67, 100)); Thread.Sleep(35); keys.Submit(new(0, 0x80, 67, 0));
+        }
+        var deadline = Stopwatch.StartNew();
+        while (session.IsRunning) { if (deadline.Elapsed.TotalSeconds > 5) throw new TimeoutException("Recording did not end naturally"); Thread.Sleep(10); }
+        Check(ReferenceEquals(Field<SongProject>("savedProject"), session.Project), "Naturally finished recording is still pending before UI refresh");
+        var button = window.GetVisualDescendants().OfType<Button>().Single(b => Equals(b.Content, "New song"));
+        button.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+        var dialog = window.OwnedWindows.Single(w => w.Title == "New song");
+        Check(session.Project.Id == oldId && session.SelectedSection.Parts.Any(p => p.Role == PartRole.Phrase && p.Pattern.Notes.Any(n => n.Pitch == 67))
+            && session.Takes.Any(t => t.Inputs.Any(e => e.Data1 == 67)), "New song surfaces naturally finished recorded notes and raw take before confirmation");
+        dialog.GetVisualDescendants().OfType<TextBox>().Single().Text = "Next";
+        dialog.KeyPress(Key.Enter, RawInputModifiers.None, PhysicalKey.None, null); Pump();
+        var unsaved = window.OwnedWindows.Single(w => w.Title == "Unsaved project"); Click(unsaved, "Cancel"); Pump();
+        Check(session.Project.Id == oldId && session.SelectedSection.Parts.Any(p => p.Role == PartRole.Phrase && p.Pattern.Notes.Any(n => n.Pitch == 67))
+            && session.Takes.Any(t => t.Inputs.Any(e => e.Data1 == 67)), "Cancel retains the naturally completed recording and take");
+        session.Arm(WorkbenchSession.NewPhrase); session.StartSection();
+        using (var keys = backend.OpenOutput("loopback"))
+        {
+            keys.Submit(new(0, 0x90, 72, 100)); Thread.Sleep(35); keys.Submit(new(0, 0x80, 72, 0));
+        }
+        deadline.Restart();
+        while (session.IsRunning) { if (deadline.Elapsed.TotalSeconds > 5) throw new TimeoutException("Recording did not end naturally"); Thread.Sleep(10); }
+        var directory = session.TakeDirectory!; var held = directory + "-held-new-song-test";
+        Directory.Move(directory, held); File.WriteAllText(directory, "injected archive failure");
+        try
+        {
+            button.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent)); Pump();
+            Check(!window.OwnedWindows.Any(w => w.Title == "New song") && session.Project.Id == oldId
+                && session.Take().Inputs.Any(e => e.Data1 == 72), "Archive failure blocks New song while keeping the current raw take recoverable");
+        }
+        finally { File.Delete(directory); Directory.Move(held, directory); }
     }
     private static void CheckVariationSeedFlows()
     {

@@ -158,27 +158,45 @@ internal sealed class NoteEditor : Control
     public void RevealMaterial() => QueueReveal(material: true);
     private void QueueReveal(bool material)
     {
-        var id = SelectedId; var pattern = part?.Pattern;
+        var id = SelectedId; var selected = selection.ToHashSet(StringComparer.Ordinal); var pattern = part?.Pattern;
         if ((!material && id is null) || pattern is null || pattern.Notes.IsEmpty) return;
         // A commit can add a drum lane or resize the editor. Reveal after layout,
         // and ignore requests superseded by another selection or edit.
         Dispatcher.UIThread.Post(() =>
         {
-            if (SelectedId != id || !ReferenceEquals(part?.Pattern, pattern)) return;
+            if (SelectedId != id || !selection.SetEquals(selected) || !ReferenceEquals(part?.Pattern, pattern)) return;
             var scroll = this.GetVisualAncestors().OfType<ScrollViewer>().FirstOrDefault();
             if (scroll is null || scroll.Viewport.Width <= Labels || scroll.Viewport.Height <= Header) return;
             var visible = new Rect(scroll.Offset.X + Labels, scroll.Offset.Y + Header,
                 scroll.Viewport.Width - Labels, scroll.Viewport.Height - Header);
-            // New proposals need a visible musical reference, but must retain a
-            // useful manually chosen viewport when no note is selected.
-            if (material && id is null && pattern.Notes.Any(n => NoteRect(n).Intersects(visible))) return;
-            var note = pattern.Notes.FirstOrDefault(n => n.Id == id) ?? (material ? pattern.Notes[0] : null);
+            var visibleNote = material && id is null ? pattern.Notes.FirstOrDefault(n => NoteRect(n).Intersects(visible)) : null;
+            var note = pattern.Notes.FirstOrDefault(n => n.Id == id) ?? visibleNote ?? (material ? pattern.Notes[0] : null);
             if (note is null) return;
             var bounds = NoteRect(note);
+            var top = bounds.Top; var bottom = bounds.Bottom;
+            // Frame the complete musical register when it fits. If a proposal is
+            // too wide, retain a useful manual view or fall back to its selection.
+            IEnumerable<MidiNote> spanNotes = material ? pattern.Notes : pattern.Notes.Where(n => selected.Contains(n.Id));
+            var spanTop = double.PositiveInfinity; var spanBottom = double.NegativeInfinity;
+            foreach (var item in spanNotes)
+            {
+                var rect = NoteRect(item); spanTop = Math.Min(spanTop, rect.Top); spanBottom = Math.Max(spanBottom, rect.Bottom);
+            }
+            if (spanBottom - spanTop <= visible.Height - 8) { top = spanTop; bottom = spanBottom; }
+            else if (material && id is null && visibleNote is not null) return;
+            else if (material && selected.Count > 1)
+            {
+                spanTop = double.PositiveInfinity; spanBottom = double.NegativeInfinity;
+                foreach (var item in pattern.Notes.Where(n => selected.Contains(n.Id)))
+                {
+                    var rect = NoteRect(item); spanTop = Math.Min(spanTop, rect.Top); spanBottom = Math.Max(spanBottom, rect.Bottom);
+                }
+                if (spanBottom - spanTop <= visible.Height - 8) { top = spanTop; bottom = spanBottom; }
+            }
             // Long notes reveal their start; the sticky ruler and pitch labels
             // must not cover the selected note after scrolling.
-            var focus = new Rect(bounds.Position, new Size(Math.Min(bounds.Width, Math.Max(1, visible.Width - 8)),
-                Math.Min(bounds.Height, Math.Max(1, visible.Height - 8))));
+            var focus = new Rect(new Point(bounds.Left, top), new Size(Math.Min(bounds.Width, Math.Max(1, visible.Width - 8)),
+                Math.Min(bottom - top, Math.Max(1, visible.Height - 8))));
             if (focus.Left >= visible.Left && focus.Top >= visible.Top && focus.Right <= visible.Right && focus.Bottom <= visible.Bottom) return;
             this.BringIntoView(new Rect(Math.Max(0, focus.Left - Labels - 4), Math.Max(0, focus.Top - Header - 4),
                 Math.Min(scroll.Viewport.Width, focus.Width + Labels + 8), Math.Min(scroll.Viewport.Height, focus.Height + Header + 8)));

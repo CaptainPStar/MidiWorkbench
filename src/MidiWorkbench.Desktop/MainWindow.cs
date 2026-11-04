@@ -56,6 +56,7 @@ public sealed partial class MainWindow : Window
     private readonly List<Control> stoppedControls = new();
     private readonly HashSet<Control> pendingButtons = new();
     private Func<Task<string?>>? takeSavePicker = null;
+    private Func<string, Task<string?>>? midiExportPicker = null;
     private readonly List<Control> noteEditControls = new();
     private readonly Button play, playSection, undo, redo, accept, discard, audition, returnAudition, cancelGeneration, prepareSection, varySection, cancelQueued;
     private readonly ComboBox candidateBoundary = new() { ItemsSource = new[] { "Bar", "Beat" }, SelectedIndex = 0 };
@@ -99,7 +100,7 @@ public sealed partial class MainWindow : Window
             Button("Stop", () => { session.Stop(); Reload(); RefreshTakes(); }, emergency: true), panic, loop, Label("BPM", tempo),
             Button("Set", () => session.SetTempo((double)(tempo.Value ?? 120))), beat, pulse, queuedStatus, cancelQueued);
         Tip(loop, "Repeat the current playback range"); Tip(tempo, "Quarter-note beats per minute");
-        var files = Wrap(AsyncButton("Open", Open, true, true), AsyncButton("Save", Save, modal: true), AsyncButton("Save as", SaveAs, modal: true), AsyncButton("Rename song", RenameSong, true, true), AsyncButton("Save take", SaveTake, true, true),
+        var files = Wrap(AsyncButton("New song", NewSong, true, true), AsyncButton("Open", Open, true, true), AsyncButton("Save", Save, modal: true), AsyncButton("Save as", SaveAs, modal: true), AsyncButton("Rename song", RenameSong, true, true), AsyncButton("Save take", SaveTake, true, true),
             AsyncButton("Export MIDI", Export, modal: true), undo, redo);
 
         sections.SelectionChanged += async (_, _) =>
@@ -622,8 +623,17 @@ public sealed partial class MainWindow : Window
     private async Task Export()
     {
         RequireStoppedForPicker();
-        var file = await StorageProvider.SaveFilePickerAsync(new() { Title = "Export song as MIDI", SuggestedFileName = "song.mid", FileTypeChoices = [MidiType] });
-        if (file?.TryGetLocalPath() is { } path) session.ExportArrangementMidi(path);
+        var options = await ChooseMidiExport();
+        if (options is null) return;
+        RequireStoppedForPicker();
+        var suggested = options.SongOrder ? "song.mid" : "section.mid";
+        var path = midiExportPicker is null
+            ? (await StorageProvider.SaveFilePickerAsync(new() { Title = "Export MIDI", SuggestedFileName = suggested, FileTypeChoices = [MidiType] }))?.TryGetLocalPath()
+            : await midiExportPicker(suggested);
+        if (path is null) return;
+        var channels = options.CurrentRouting ? ExportChannelMode.RoutingOverrides : ExportChannelMode.ProjectChannels;
+        if (options.SongOrder) session.ExportArrangementMidi(path, channels); else session.ExportMidi(path, channels);
+        status.Text = $"Exported {Path.GetFileName(path)}";
     }
     private Control BuildBankPane()
     {

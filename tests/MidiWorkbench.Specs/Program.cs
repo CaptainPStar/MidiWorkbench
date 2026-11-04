@@ -12,6 +12,8 @@ using MidiWorkbench.Specs;
 
 var tests = new (string Name, Action Run)[]
 {
+    ("offline and live MIDI export channel policies", ExportRoutingSpecs.Run),
+    ("new empty project and safe document replacement", NewProjectSpecs.Run),
     ("section metadata renaming preserves authored music", SectionIdentitySpecs.Run),
     ("MIDI export preserves declared and recorded extent", MidiExtentSpecs.Run),
     ("harmonic placement and recipe versions", GenerationMusicalSpecs.Run),
