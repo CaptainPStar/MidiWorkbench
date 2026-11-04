@@ -16,7 +16,7 @@ The application separates musical material, prepared plans, machine routing, tra
 
 ## Thread ownership
 
-`WorkbenchSession` owns project state and port lifetimes. Immutable project snapshots and compiled plans cross the engine boundary. Generation, file access and phrase conversion occur outside the scheduler. Accepted edits have undo/redo history; candidates remain separate until accepted.
+`WorkbenchSession` owns project state and port lifetimes. Immutable project snapshots and compiled plans cross the engine boundary. Generation, file access and phrase conversion occur outside the scheduler. Accepted edits have undo/redo history; candidates remain separate until accepted. Candidate preparation uses immutable snapshots, request identities and a per-session computation gate. Supersession, cancellation, selection changes and project reload invalidate stale results. Computation may finish after cancellation, but cannot publish or overlap the next computation.
 
 `TransportHost` owns one worker and `Transport`. Ordinary commands use a bounded channel; Stop/Panic/Exit use a separate urgent path. Input callbacks timestamp and enqueue only. Each scheduler iteration limits input work so feedback or heavy input cannot starve transport commands. Status is published as immutable snapshots; the UI refresh does not drive timing.
 
@@ -30,7 +30,7 @@ Route resolution deduplicates physical ports and includes clock-only endpoints. 
 
 Stop preserves the defined queued-output tail and completes after immediate pending releases. Panic cancels future scheduled output, clears pending output and releases notes/pedals. Stale pending attacks and clock pulses are counted and skipped instead of burst-transmitted after a stall. Output faults stop playback and attempt release on other outputs.
 
-Queued plans activate at a musical boundary after the existing lookahead. Selection and launch are independent. Scene changes preserve clock continuity and release the outgoing section's owned notes. Active-plan identity changes at the actual boundary so the UI can display the correct meter.
+Queued plans activate at a musical boundary after the existing lookahead. Selection and launch are independent. Scene changes preserve clock continuity and release the outgoing section's owned notes. Live auditions use separate plan identities and do not commit the project; returning restores accepted material. Accepting commits an undoable project edit and queues the prepared plan. Cancelling that launch does not undo the committed edit. Each queued section version has a distinct plan identity mapped to an immutable section snapshot. Active-plan identity changes at the actual boundary, so accepting an edit cannot prematurely change the displayed meter or length.
 
 ## Capture and recall
 

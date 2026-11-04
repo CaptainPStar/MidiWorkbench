@@ -16,6 +16,10 @@ var tests = new (string Name, Action Run)[]
     ("composition and recording workflow suite", WorkflowSpecs.Run),
     ("configurable generator suite", GeneratorSpecs.Run),
     ("end-to-end integration suite", IntegrationSpecs.Run),
+    ("live generation suite", LiveGenerationSpecs.Run),
+    ("live transport suite", LiveTransportSpecs.Run),
+    ("batch note editing suite", NoteSelectionSpecs.Run),
+    ("live workflow integration suite", ContinuationIntegrationSpecs.Run),
     // Generation
     ("generation is deterministic", () =>
     {

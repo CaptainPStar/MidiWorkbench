@@ -70,8 +70,13 @@ public sealed class Transport(Transport.Emit emit, Transport.EmitOwned? emitOwne
         if (!plan.Endpoints.SequenceEqual(value.Endpoints) || !plan.Destinations.SequenceEqual(value.Destinations) ||
             !plan.ClockPorts.SequenceEqual(value.ClockPorts) || !plan.OffsetSeconds.SequenceEqual(value.OffsetSeconds))
             throw new ArgumentException("Queued plan must use the current endpoints, destinations and clock configuration.");
-        var after = Math.Max(clock.TickAt(now), clock.TickAt(emittedUntil));
-        var boundary = (Math.Floor(after / quantumTicks) + 1) * quantumTicks;
+        var nowTick = clock.TickAt(now);
+        var after = Math.Max(nowTick, clock.TickAt(emittedUntil));
+        // A pending launch stops lookahead at its boundary, so a replacement can
+        // use that boundary until it is reached, even if the horizon extends beyond it.
+        var nextBoundary = (Math.Floor(after / quantumTicks) + 1) * quantumTicks;
+        var boundary = queuedPlan is not null && queuedTick > nowTick && queuedTick % quantumTicks == 0 && queuedTick < nextBoundary
+            ? queuedTick : nextBoundary;
         if (boundary > long.MaxValue) throw new ArgumentOutOfRangeException(nameof(quantumTicks));
         queuedTick = (long)boundary; queuedPlan = value; queuedPorts = RequiredPorts(value);
     }

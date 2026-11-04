@@ -20,6 +20,7 @@ const string usage = """
       export-song PROJECT FILE.mid
       sections PROJECT
       generate PROJECT SECTION PART SETTINGS.json OUTPUT
+      vary PROJECT SECTION SEED OUTPUT
       validate-take TAKE
       export-take TAKE FILE.mid
       bank-create BANK PROJECT [PROJECT ...]
@@ -59,6 +60,16 @@ try
             var pattern = new PatternGenerator().Generate(selected.Outline, settings, part.Pattern);
             selected = selected with { Parts = selected.Parts.SetItem(partIndex, part with { Pattern = pattern }) };
             ProjectStore.Save(target, generatedProject with { Sections = generatedProject.Sections.SetItem(sectionIndex, selected) });
+            Console.WriteLine(target); return 0;
+        case ["vary", var source, var sectionId, var seedText, var target]:
+            if (!uint.TryParse(seedText, NumberStyles.None, CultureInfo.InvariantCulture, out var seed))
+                throw new ArgumentException("Seed must be an unsigned 32-bit integer.");
+            using (var variation = new WorkbenchSession())
+            {
+                variation.Load(source); variation.SelectSection(sectionId);
+                variation.PrepareVariationAsync(seed).GetAwaiter().GetResult();
+                variation.AcceptGeneration(); ProjectStore.Save(target, variation.Project);
+            }
             Console.WriteLine(target); return 0;
         case ["validate-take", var source]:
             var validatedTake = ProjectStore.LoadTake(source);

@@ -1,6 +1,17 @@
 # Verification status
 
-## 2026-11-04 integration, Linux x64, .NET SDK 10.0.100
+## 2026-11-04 live generation continuation
+
+- Release verification passes 51/51 specification groups, including live generation, transport replacement, batch note editing and independent workflow regressions.
+- Independent tests cover superseded requests, project reload/disposal, candidate audition and return, discarded queued auditions, fixed/locked material, note balance and clock continuity.
+- Batch edits cover group bounds, ID collisions, clipboard validation, extreme offsets and note budgets.
+- Meter-snapshot regressions cover 4/4 → 3/4 acceptance and 7/8 audition/return; the displayed section metadata changes at the actual transport boundary.
+- CLI `vary` produces byte-identical projects for repeated source/seed input. The result validates and simulates with 1,076 output events, zero late notes and complete capture. Export was independently parsed: type 1, 960 PPQ, five tracks, 153 balanced note pairs and 16 seconds.
+- Desktop pointer/keyboard checks pass for shift/marquee selection, group move/resize/delete, undo/redo, copy/paste/duplicate and velocity/lock changes. Live checks cover 4/4 → 3/8 audition, preparing 5/8 without changing the sounding meter, return to 4/4, acceptance of 5/8 and live mute/solo. No observed blocker.
+- Windows desktop and CLI self-contained packages cross-publish; execution on Windows remains untested.
+- Durable capture development is deferred in favor of generation/orchestration; a DAW or MusicSessionTrace can capture performance output.
+
+## Earlier integration, Linux x64, .NET SDK 10.0.100
 
 - Release solution build succeeds with zero warnings and errors.
 - `bash scripts/verify.sh`: 47/47 specification groups pass. Groups include the original cases, transport regressions, configurable generators, composition workflows and independent end-to-end integration tests.
@@ -26,7 +37,7 @@ Software loopback probe (4 seconds, concurrent development container): 16/16 not
 
 - WinMM is immediate-send; Windows MIDI Services has not been implemented or benchmarked. No hard-real-time guarantee.
 - WinMM endpoint identity is name plus occurrence. Input timestamps are host arrival, not calibrated driver times. Hardware MIDI is Windows-only.
-- Generation and direct note editing require stopped playback. Prepared section launches and section mute/solo use quantized replacement. Changing the active rig requires Stop.
+- Background generation works during playback. Live audition/return/acceptance targets the selected playing section without recording armed; arrangement replacement is not supported. Direct note editing and history operations require Stop. Changing the active rig requires Stop.
 - Live mute/solo applies to a known playing section, not arbitrary tracks across an arrangement or recalled take.
 - Active takes are bounded to 100,000 capture entries. Overflow/loss is reported. Completed takes are archived; in-progress capture is not streamed durably and cannot be recovered after a crash.
 - Recorded loop passes overdub. Notes crossing the section end are shortened. Raw take input preserves pedals, while converted phrase notes encode sustain as duration.

@@ -16,7 +16,9 @@ internal sealed class GeneratorPane : StackPanel
         enabled = new() { Text = "" }, groups = new() { Text = "" };
     private readonly ComboBox direction = new() { ItemsSource = Enum.GetValues<ArpeggioDirection>(), SelectedItem = ArpeggioDirection.Up };
     private readonly CheckBox source = new() { Content = "Use part notes" };
-    public event Action<GeneratorSettings>? Prepare;
+    private readonly Button preview = new() { Content = "Preview part" };
+    public Func<GeneratorSettings, Task>? Prepare { get; set; }
+    public bool IsPreparing { set => preview.IsEnabled = !value; }
     public event Action<Exception>? Error;
     public GeneratorPane()
     {
@@ -32,8 +34,12 @@ internal sealed class GeneratorPane : StackPanel
         ToolTip.SetTip(groups, "Optional denominator-note groups, for example 2,2,3 in 7/8");
         ToolTip.SetTip(source, "Arpeggiate the selected part's notes; source notes are copied into the recipe");
         Children.Add(source);
-        var preview = new Button { Content = "Preview part" };
-        preview.Click += (_, _) => { try { Prepare?.Invoke(Read()); } catch (Exception ex) { Error?.Invoke(ex); } };
+        preview.Click += async (_, _) =>
+        {
+            preview.IsEnabled = false;
+            try { if (Prepare is not null) await Prepare(Read()); } catch (Exception ex) { Error?.Invoke(ex); }
+            finally { preview.IsEnabled = true; }
+        };
         Children.Add(preview);
         kind.SelectionChanged += (_, _) => UpdateFields(); UpdateFields();
         steps.PropertyChanged += (_, e) =>

@@ -3,11 +3,14 @@
   "sdk": "10.0.100",
   "platform": "linux-x64",
   "release_build": "passed",
-  "specification_groups": 47,
-  "specification_groups_passed": 47,
+  "specification_groups": 51,
+  "specification_groups_passed": 51,
   "desktop_xvfb": "passed",
   "independent_smf_parser": "mido",
   "windows_cross_publish": "passed",
   "windows_execution": "not-run",
-  "physical_midi": "not-run"
+  "physical_midi": "not-run",
+  "live_generation": "passed",
+  "batch_note_editing": "passed",
+  "seeded_variation_cli": "passed"
 }

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Collections.Immutable;
 using Avalonia;
 using Avalonia.Automation;
 using Avalonia.Controls;
@@ -6,8 +7,11 @@ using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.VisualTree;
 using MidiWorkbench.Domain;
+using MidiWorkbench.Application;
 
 namespace MidiWorkbench.Desktop;
+
+internal sealed record NoteEdit(ImmutableArray<MidiNote> Upserts, ImmutableArray<string> DeleteIds, ImmutableArray<string> Selection);
 
 // Gestures publish one edit on release, so a drag is one undo step.
 internal sealed class NoteEditor : Control
@@ -20,13 +24,23 @@ internal sealed class NoteEditor : Control
     private Part? part;
     private Outline? outline;
     private int[] lanes = [];
-    private MidiNote? original, draft;
+    private MidiNote? anchor;
+    private ImmutableArray<MidiNote> gesture = [], copied = [];
+    private readonly HashSet<string> selection = new(StringComparer.Ordinal);
+    private Dictionary<string, MidiNote> draft = new(StringComparer.Ordinal);
     private Point origin;
-    private bool resizing, dragging;
+    private Rect? marquee;
+    private string[] marqueeBase = [];
+    private string? sectionIdentity;
+    private IPointer? captured;
+    private long insertTick;
+    private bool resizing, dragging, adding;
     private long snap = MusicalTime.Ppq / 4;
     private double pixelsPerQuarter = 96;
     private double playhead = -1;
     public string? SelectedId { get; private set; }
+    public IReadOnlyCollection<string> SelectedIds => selection.ToArray();
+    public ImmutableArray<MidiNote> SelectedNotes => part?.Pattern.Notes.Where(n => selection.Contains(n.Id)).ToImmutableArray() ?? [];
     public bool DrumMode { get; private set; }
     public bool ReadOnly { get; set; }
     public int NewVelocity { get; set; } = 90;
@@ -35,30 +49,95 @@ internal sealed class NoteEditor : Control
     public double Zoom { get => pixelsPerQuarter; set { pixelsPerQuarter = Math.Clamp(value, 24, 240); Resize(); } }
     public double Playhead { get => playhead; set { if (Math.Abs(playhead - value) > .01) { playhead = value; InvalidateVisual(); } } }
     public event Action<MidiNote?>? SelectionChanged;
-    public event Action<MidiNote>? NoteEdited;
-    public event Action<string>? NoteDeleted;
+    public Func<NoteEdit, bool>? CommitEdit { get; set; }
+    public event Action<Exception>? Error;
 
     public NoteEditor()
     {
         Focusable = true; ClipToBounds = true;
         AutomationProperties.SetName(this, "Note editor");
-        ToolTip.SetTip(this, "Click empty space to add. Drag a note to move; drag its right edge to resize. Right-click or Delete removes. Arrows move; Shift+Left/Right resizes; L toggles lock; +/- changes velocity.");
+        ToolTip.SetTip(this, "Click to add; drag empty space to select a rectangle. Shift-click toggles notes. Drag selected notes to move; right edges resize. Click the ruler to place pasted notes. Ctrl+A selects all; Ctrl+C/V copies/pastes; Ctrl+D duplicates; Delete removes. Arrows move; Shift+Left/Right resizes; L locks; +/- changes velocity.");
     }
-    public void Show(Part? value, Outline? section, bool drums)
+    public void Show(Part? value, Outline? section, bool drums, string? sectionId = null)
     {
-        var changed = part?.Id != value?.Id || DrumMode != drums;
+        var changed = part?.Id != value?.Id || sectionIdentity != sectionId || DrumMode != drums;
+        if (!ReferenceEquals(part?.Pattern, value?.Pattern)) { captured?.Capture(null); CancelGesture(); }
+        sectionIdentity = sectionId;
         part = value; outline = section; DrumMode = drums;
         lanes = drums ? new[] { 49, 51, 46, 42, 44, 39, 38, 40, 50, 48, 47, 45, 43, 41, 36, 35 }
             .Concat(value?.Pattern.Notes.Select(n => n.Pitch).Distinct().Except(new[] { 49, 51, 46, 42, 44, 39, 38, 40, 50, 48, 47, 45, 43, 41, 36, 35 }) ?? []).ToArray()
             : Enumerable.Range(0, 128).Reverse().ToArray();
-        if (changed) SelectedId = null;
-        if (SelectedId is not null && value?.Pattern.Notes.Any(n => n.Id == SelectedId) != true) SelectedId = null;
+        if (changed) { selection.Clear(); SelectedId = null; insertTick = 0; CancelGesture(); }
+        var valid = value?.Pattern.Notes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal) ?? [];
+        selection.RemoveWhere(id => !valid.Contains(id));
+        if (SelectedId is not null && !selection.Contains(SelectedId)) SelectedId = selection.FirstOrDefault();
         Resize();
     }
-    public void Select(string? id)
+    public void Select(string? id) => SelectMany(id is null ? [] : [id], id);
+    public void SelectMany(IEnumerable<string> ids, string? primary = null)
     {
-        SelectedId = id; SelectionChanged?.Invoke(part?.Pattern.Notes.FirstOrDefault(n => n.Id == id)); InvalidateVisual();
+        var valid = part?.Pattern.Notes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal) ?? [];
+        selection.Clear(); selection.UnionWith(ids.Where(valid.Contains));
+        SelectedId = primary is not null && selection.Contains(primary) ? primary : part?.Pattern.Notes.FirstOrDefault(n => selection.Contains(n.Id))?.Id;
+        SelectionChanged?.Invoke(part?.Pattern.Notes.FirstOrDefault(n => n.Id == SelectedId));
+        AutomationProperties.SetName(this, $"Note editor, {selection.Count} selected");
+        InvalidateVisual();
     }
+    public void SelectAll() => SelectMany(part?.Pattern.Notes.Select(n => n.Id) ?? []);
+    public void Copy()
+    {
+        if (part is null || outline is null) return;
+        if (!SelectedNotes.IsEmpty) insertTick = SelectedNotes.Max(n => n.EndTick);
+        copied = NoteSelectionEdits.Copy(part.Pattern, selection, outline.LengthTicks);
+    }
+    public void Paste() => Command(() =>
+    {
+        if (outline is null || ReadOnly || copied.IsEmpty) return;
+        if (part is null) return;
+        var pattern = NoteSelectionEdits.Paste(part.Pattern, copied, outline.LengthTicks, insertTick);
+        PublishCopies(pattern);
+    });
+    public void Duplicate() => Command(() =>
+    {
+        var notes = SelectedNotes;
+        if (outline is null || ReadOnly || notes.IsEmpty) return;
+        var end = notes.Max(n => n.EndTick);
+        var at = end + (snap - end % snap) % snap;
+        if (part is null) return;
+        var pattern = NoteSelectionEdits.Duplicate(part.Pattern, selection, outline.LengthTicks, at - notes.Min(n => n.Tick));
+        PublishCopies(pattern);
+    });
+    public void DeleteSelection()
+    {
+        if (!ReadOnly && selection.Count > 0 && part is not null && outline is not null) PublishPattern(NoteSelectionEdits.Delete(part.Pattern, selection, outline.LengthTicks), []);
+    }
+    public void ApplyFields(MidiNote edited) => Command(() =>
+    {
+        if (ReadOnly || outline is null || SelectedNotes.IsEmpty || part?.Pattern.Notes.FirstOrDefault(n => n.Id == SelectedId) is not { } primary) return;
+        var moved = NoteSelectionEdits.Move(part.Pattern, selection, outline.LengthTicks, edited.Tick - primary.Tick, edited.Pitch - primary.Pitch);
+        var resized = NoteSelectionEdits.Resize(moved, selection, outline.LengthTicks, edited.Duration - primary.Duration);
+        var velocity = NoteSelectionEdits.SetVelocity(resized, selection, outline.LengthTicks, edited.Velocity);
+        PublishPattern(NoteSelectionEdits.SetLocked(velocity, selection, outline.LengthTicks, edited.Locked), selection.ToArray());
+    });
+    public void Add(MidiNote note) { if (!ReadOnly) Publish([note], [], [note.Id]); }
+    private void PublishCopies(Pattern pattern)
+    {
+        var existing = part!.Pattern.Notes.Select(n => n.Id).ToHashSet(StringComparer.Ordinal);
+        var added = pattern.Notes.Where(n => !existing.Contains(n.Id)).ToImmutableArray();
+        if (PublishPattern(pattern, added.Select(n => n.Id)) && !added.IsEmpty) insertTick = added.Max(n => n.EndTick);
+    }
+    private bool PublishPattern(Pattern pattern, IEnumerable<string> selected) =>
+        Publish(pattern.Notes, part!.Pattern.Notes.Select(n => n.Id).Except(pattern.Notes.Select(n => n.Id)), selected);
+    private bool Publish(IEnumerable<MidiNote> notes, IEnumerable<string> deleted, IEnumerable<string> selected)
+    {
+        var existing = part?.Pattern.Notes.ToDictionary(n => n.Id, StringComparer.Ordinal) ?? [];
+        var changed = notes.Where(n => existing.GetValueOrDefault(n.Id) != n).ToImmutableArray();
+        var removed = deleted.ToImmutableArray(); var ids = selected.ToImmutableArray();
+        if (changed.IsEmpty && removed.IsEmpty) return false;
+        if (CommitEdit?.Invoke(new(changed, removed, ids)) != true) return false;
+        SelectMany(ids, SelectedId); return true;
+    }
+    private void Command(Action command) { try { command(); } catch (Exception ex) { Error?.Invoke(ex); } }
     public double SuggestedOffset => DrumMode ? 0 : Math.Max(0, Header + (127 - (part?.Pattern.Notes.Select(n => n.Pitch).DefaultIfEmpty(60).Max() ?? 60) - 2) * Lane);
     private Rect Viewport => this.GetVisualAncestors().OfType<ScrollViewer>().FirstOrDefault() is { } s
         ? new Rect(s.Offset.X, s.Offset.Y, s.Viewport.Width, s.Viewport.Height) : new Rect(Bounds.Size);
@@ -103,20 +182,21 @@ internal sealed class NoteEditor : Control
         }
         foreach (var stored in part.Pattern.Notes)
         {
-            var n = draft?.Id == stored.Id ? draft : stored;
+            var n = draft.GetValueOrDefault(stored.Id, stored);
             var rect = NoteRect(n);
             if (!rect.Intersects(viewport)) continue;
-            context.FillRectangle(n.Id == SelectedId ? SelectedBrush : NoteBrush, rect, 2);
+            context.FillRectangle(selection.Contains(n.Id) ? SelectedBrush : NoteBrush, rect, 2);
             var velocityHeight = (Lane - 7) * n.Velocity / 127d;
             context.FillRectangle(Ink, new Rect(rect.X + 2, rect.Bottom - velocityHeight - 1, 2, velocityHeight));
             if (n.Locked) context.DrawRectangle(null, new Pen(Brushes.White, 1), rect.Deflate(2));
-            if (n.Id == SelectedId && rect.Width > 9) context.DrawLine(new Pen(BackgroundBrush, 2), new Point(rect.Right - 3, rect.Y + 3), new Point(rect.Right - 3, rect.Bottom - 3));
+            if (selection.Contains(n.Id) && rect.Width > 9) context.DrawLine(new Pen(BackgroundBrush, 2), new Point(rect.Right - 3, rect.Y + 3), new Point(rect.Right - 3, rect.Bottom - 3));
         }
         if (playhead >= 0 && playhead <= outline.LengthTicks)
         {
             var x = Labels + playhead * pixelsPerQuarter / MusicalTime.Ppq;
             context.DrawLine(new Pen(Brushes.White, 1.5), new Point(x, 0), new Point(x, Height));
         }
+        if (marquee is { } area) context.DrawRectangle(new SolidColorBrush(Color.Parse("#4BAEBC"), .15), new Pen(SelectedBrush), area);
         // Keep the ruler and pitch labels readable while either axis scrolls.
         context.FillRectangle(BackgroundBrush, new Rect(viewport.Left, viewport.Top, Labels, viewport.Height));
         for (var i = firstRow; i < lastRow; i++)
@@ -136,73 +216,132 @@ internal sealed class NoteEditor : Control
         if (part is null || outline is null || lanes.Length == 0) return;
         Focus(); var point = e.GetCurrentPoint(this); var pos = point.Position;
         var viewport = Viewport;
-        if (pos.X < viewport.Left + Labels || pos.Y < viewport.Top + Header) return;
+        if (pos.X < viewport.Left + Labels) return;
+        if (pos.Y < viewport.Top + Header)
+        {
+            insertTick = Math.Min(outline.LengthTicks, Snap((pos.X - Labels) * MusicalTime.Ppq / pixelsPerQuarter));
+            e.Handled = true; InvalidateVisual(); return;
+        }
         var hit = part.Pattern.Notes.Reverse().FirstOrDefault(n => NoteRect(n).Contains(pos));
+        var additive = e.KeyModifiers.HasFlag(KeyModifiers.Shift) || e.KeyModifiers.HasFlag(KeyModifiers.Control);
         if (point.Properties.IsRightButtonPressed)
         {
-            if (!ReadOnly && hit is not null) { Select(hit.Id); NoteDeleted?.Invoke(hit.Id); }
+            if (hit is not null) { if (!selection.Contains(hit.Id)) Select(hit.Id); DeleteSelection(); }
             e.Handled = true; return;
         }
         if (!point.Properties.IsLeftButtonPressed) return;
-        Select(hit?.Id);
-        if (ReadOnly) { e.Handled = true; return; }
+        origin = pos; dragging = false; adding = hit is null && !additive;
+        insertTick = Math.Min(outline.LengthTicks - 1, Snap((pos.X - Labels) * MusicalTime.Ppq / pixelsPerQuarter));
         if (hit is null)
         {
-            var at = Math.Min(Math.Max(0, outline.LengthTicks - 1), Snap((pos.X - Labels) * MusicalTime.Ppq / pixelsPerQuarter));
-            var n = new MidiNote(Guid.NewGuid().ToString("N"), at, Math.Min(Math.Max(1, NewDuration), outline.LengthTicks - at), PitchAt(pos.Y), NewVelocity, true);
-            NoteEdited?.Invoke(n); Select(n.Id);
+            marqueeBase = additive ? selection.ToArray() : [];
+            if (!additive) Select(null);
+            marquee = new Rect(pos, pos);
         }
         else
         {
-            original = draft = hit; origin = pos; dragging = false;
+            if (additive)
+            {
+                var ids = selection.ToHashSet(StringComparer.Ordinal);
+                if (!ids.Add(hit.Id)) { ids.Remove(hit.Id); SelectMany(ids); e.Handled = true; return; }
+                SelectMany(ids, hit.Id);
+            }
+            else if (!selection.Contains(hit.Id)) Select(hit.Id);
+            if (ReadOnly) { e.Handled = true; return; }
+            anchor = hit; gesture = SelectedNotes;
             resizing = pos.X >= NoteRect(hit).Right - Math.Min(7, NoteRect(hit).Width / 3);
-            e.Pointer.Capture(this);
         }
-        e.Handled = true;
+        captured = e.Pointer; captured.Capture(this); e.Handled = true;
     }
     protected override void OnPointerMoved(PointerEventArgs e)
     {
         base.OnPointerMoved(e);
-        if (original is null || outline is null || ReadOnly) return;
+        if (captured is null || outline is null) return;
         var pos = e.GetPosition(this);
         if (!dragging && Math.Abs(pos.X - origin.X) < 3 && Math.Abs(pos.Y - origin.Y) < 3) return;
         dragging = true;
-        var delta = (long)Math.Round((pos.X - origin.X) * MusicalTime.Ppq / pixelsPerQuarter / snap, MidpointRounding.AwayFromZero) * snap;
-        draft = resizing ? original with { Duration = Math.Clamp(original.Duration + delta, Math.Min(snap, outline.LengthTicks - original.Tick), outline.LengthTicks - original.Tick) }
-            : original with { Tick = Math.Clamp(original.Tick + delta, 0, outline.LengthTicks - original.Duration), Pitch = PitchAt(pos.Y) };
+        if (marquee is not null)
+        {
+            marquee = new Rect(origin, pos).Normalize();
+            SelectMany(marqueeBase.Concat(part?.Pattern.Notes.Where(n => NoteRect(n).Intersects(marquee.Value)).Select(n => n.Id) ?? []));
+        }
+        else if (anchor is not null && !ReadOnly)
+        {
+            var delta = (long)Math.Round((pos.X - origin.X) * MusicalTime.Ppq / pixelsPerQuarter / snap, MidpointRounding.AwayFromZero) * snap;
+            var source = part!.Pattern with { Notes = gesture };
+            var edited = resizing ? NoteSelectionEdits.Resize(source, selection, outline.LengthTicks, delta)
+                : NoteSelectionEdits.Move(source, selection, outline.LengthTicks, delta, PitchAt(pos.Y) - anchor.Pitch);
+            draft = edited.Notes.ToDictionary(n => n.Id, StringComparer.Ordinal);
+        }
         InvalidateVisual();
     }
     protected override void OnPointerReleased(PointerReleasedEventArgs e)
     {
         base.OnPointerReleased(e);
-        var changed = dragging && draft != original ? draft : null;
-        original = draft = null; dragging = false; e.Pointer.Capture(null);
-        if (changed is not null && !ReadOnly) NoteEdited?.Invoke(changed);
+        if (captured is null) return;
+        var add = adding && !dragging && !ReadOnly;
+        var changed = dragging && marquee is null && !ReadOnly ? draft.Values.ToArray() : [];
+        var selected = selection.ToArray(); var at = insertTick; var pos = origin;
+        CancelGesture(); e.Pointer.Capture(null);
+        if (add && outline is not null)
+        {
+            var note = new MidiNote(Guid.NewGuid().ToString("N"), at, Math.Min(Math.Max(1, NewDuration), outline.LengthTicks - at), PitchAt(pos.Y), NewVelocity, true);
+            Add(note); insertTick = note.EndTick;
+        }
+        else if (changed.Length > 0) Publish(changed, [], selected);
         InvalidateVisual(); e.Handled = true;
+    }
+    private void CancelGesture()
+    {
+        anchor = null; gesture = []; draft.Clear(); marquee = null; marqueeBase = [];
+        captured = null; dragging = adding = false; InvalidateVisual();
     }
     protected override void OnPointerCaptureLost(PointerCaptureLostEventArgs e)
     {
-        original = draft = null; dragging = false; InvalidateVisual(); base.OnPointerCaptureLost(e);
+        CancelGesture(); base.OnPointerCaptureLost(e);
     }
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
-        if (ReadOnly || outline is null || part?.Pattern.Notes.FirstOrDefault(n => n.Id == SelectedId) is not { } n) return;
-        MidiNote? edited = e.Key switch
+        if (captured is not null) { captured.Capture(null); CancelGesture(); }
+        var command = e.KeyModifiers.HasFlag(KeyModifiers.Control) || e.KeyModifiers.HasFlag(KeyModifiers.Meta);
+        if (command)
         {
-            Key.Left when e.KeyModifiers.HasFlag(KeyModifiers.Shift) => n with { Duration = Math.Max(1, n.Duration - snap) },
-            Key.Right when e.KeyModifiers.HasFlag(KeyModifiers.Shift) => n with { Duration = Math.Min(outline.LengthTicks - n.Tick, n.Duration + snap) },
-            Key.Left => n with { Tick = Math.Max(0, n.Tick - snap) },
-            Key.Right => n with { Tick = Math.Min(outline.LengthTicks - n.Duration, n.Tick + snap) },
-            Key.Up => n with { Pitch = Math.Min(127, n.Pitch + 1) },
-            Key.Down => n with { Pitch = Math.Max(0, n.Pitch - 1) },
-            Key.L => n with { Locked = !n.Locked },
-            Key.Add or Key.OemPlus => n with { Velocity = Math.Min(127, n.Velocity + 5) },
-            Key.Subtract or Key.OemMinus => n with { Velocity = Math.Max(1, n.Velocity - 5) },
+            switch (e.Key)
+            {
+                case Key.A: SelectAll(); break;
+                case Key.C: Copy(); break;
+                case Key.X: if (!ReadOnly) { Copy(); DeleteSelection(); } break;
+                case Key.V: Paste(); break;
+                case Key.D: Duplicate(); break;
+                default: return;
+            }
+            e.Handled = true; return;
+        }
+        if (e.Key == Key.Escape) { captured?.Capture(null); CancelGesture(); Select(null); e.Handled = true; return; }
+        if (e.Key is Key.Home or Key.End || selection.Count == 0 && e.Key is Key.Left or Key.Right or Key.Up or Key.Down)
+        {
+            var n = e.Key == Key.End ? part?.Pattern.Notes.LastOrDefault() : part?.Pattern.Notes.FirstOrDefault();
+            if (n is not null) { Select(n.Id); this.BringIntoView(NoteRect(n)); }
+            e.Handled = true; return;
+        }
+        if (ReadOnly || outline is null || SelectedNotes.IsEmpty) return;
+        var notes = SelectedNotes; var pattern = part!.Pattern;
+        Pattern? edited = e.Key switch
+        {
+            Key.Left when e.KeyModifiers.HasFlag(KeyModifiers.Shift) => NoteSelectionEdits.Resize(pattern, selection, outline.LengthTicks, -snap),
+            Key.Right when e.KeyModifiers.HasFlag(KeyModifiers.Shift) => NoteSelectionEdits.Resize(pattern, selection, outline.LengthTicks, snap),
+            Key.Left => NoteSelectionEdits.Move(pattern, selection, outline.LengthTicks, -snap),
+            Key.Right => NoteSelectionEdits.Move(pattern, selection, outline.LengthTicks, snap),
+            Key.Up => NoteSelectionEdits.Move(pattern, selection, outline.LengthTicks, 0, 1),
+            Key.Down => NoteSelectionEdits.Move(pattern, selection, outline.LengthTicks, 0, -1),
+            Key.L => NoteSelectionEdits.SetLocked(pattern, selection, outline.LengthTicks, !notes.All(n => n.Locked)),
+            Key.Add or Key.OemPlus => NoteSelectionEdits.AdjustVelocity(pattern, selection, outline.LengthTicks, 5),
+            Key.Subtract or Key.OemMinus => NoteSelectionEdits.AdjustVelocity(pattern, selection, outline.LengthTicks, -5),
             _ => null
         };
-        if (e.Key is Key.Delete or Key.Back) { NoteDeleted?.Invoke(n.Id); e.Handled = true; }
-        else if (edited is not null) { NoteEdited?.Invoke(edited); e.Handled = true; }
+        if (e.Key is Key.Delete or Key.Back) { DeleteSelection(); e.Handled = true; }
+        else if (edited is not null) { PublishPattern(edited, selection.ToArray()); e.Handled = true; }
     }
     internal static string PitchLabel(int pitch) => $"{new[] { "C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B" }[pitch % 12]}{pitch / 12 - 1}  {pitch}";
     private static string DrumLabel(int pitch) => pitch switch

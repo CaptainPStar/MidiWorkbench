@@ -28,6 +28,7 @@ public sealed class MainWindow : Window
     private readonly ScrollViewer rollScroll;
     private readonly BeatPulse pulse = new() { Width = 220 };
     private readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromMilliseconds(50) };
+    private readonly TextBlock selectedCount = new(), queuedStatus = new();
     private readonly TextBlock status = new(), beat = new() { FontSize = 20, MinWidth = 120 }, activity = new(), candidateLabel = new();
     private readonly TextBox sectionName = new(), scale = new();
     private readonly TextBox bankName = new() { Text = "Bank" };
@@ -48,10 +49,11 @@ public sealed class MainWindow : Window
         mode = new() { ItemsSource = new[] { "Piano roll", "Drum grid" }, SelectedIndex = 0 },
         snap = new() { ItemsSource = new[] { "1/4", "1/8", "1/16", "1/32", "1/8T", "1/16T", "Off" }, SelectedIndex = 2 };
     private readonly Slider zoom = new() { Minimum = 24, Maximum = 240, Value = 96, Width = 110 };
-    private readonly ListBox notes = new() { MaxHeight = 130 };
+    private readonly ListBox notes = new() { MaxHeight = 130, SelectionMode = SelectionMode.Multiple };
     private readonly NumericUpDown pitch = Number(0, 127, 60), velocity = Number(1, 127, 90), tick = Number(0, 1000000000, 0), duration = Number(1, 1000000000, 240);
     private readonly List<Control> stoppedControls = new();
-    private readonly Button play, undo, redo, accept, discard, audition;
+    private readonly Button play, undo, redo, accept, discard, audition, returnAudition, cancelGeneration, prepareSection, varySection, cancelQueued;
+    private readonly ComboBox candidateBoundary = new() { ItemsSource = new[] { "Bar", "Beat" }, SelectedIndex = 0 };
     private readonly string layout = Path.Combine(Settings, "layout.json");
     private Section? candidate;
     private PerformanceTake[] takeItems = [];
@@ -76,9 +78,10 @@ public sealed class MainWindow : Window
         redo = Button("Redo", () => { session.Redo(); ClearCandidate(); Reload(); }, true);
         Tip(undo, "Undo the last project edit (Ctrl+Z)"); Tip(redo, "Redo the last undone edit (Ctrl+Shift+Z)");
         play = Button("Play song", () => { playback = session.Armed is null ? "song" : "section"; auditionSection = session.SelectedSection; if (session.Armed is null) session.StartArrangement(loop.IsChecked == true); else session.StartSection(session.SelectedSectionId, loop.IsChecked == true); });
+        cancelQueued = Button("Cancel queue", session.CancelQueuedSection);
         var transport = Row(play,
             Button("Stop", () => { session.Stop(); Reload(); RefreshTakes(); }), panic, loop, Label("BPM", tempo),
-            Button("Set", () => session.SetTempo((double)(tempo.Value ?? 120))), beat, pulse);
+            Button("Set", () => session.SetTempo((double)(tempo.Value ?? 120))), beat, pulse, queuedStatus, cancelQueued);
         Tip(loop, "Repeat the current playback range"); Tip(tempo, "Quarter-note beats per minute");
         var files = Row(AsyncButton("Open", Open, true), AsyncButton("Save", Save), AsyncButton("Save take", SaveTake, true),
             AsyncButton("Export MIDI", Export), undo, redo);
@@ -91,24 +94,34 @@ public sealed class MainWindow : Window
         Tip(sectionTools, "Reorder sections; the song follows this order unless a custom song order is set");
         drummer.SelectionChanged += (_, _) => { if (!loading && drummer.SelectedIndex > 0) ShowDrummer(DrumPersonas.All[drummer.SelectedIndex - 1].Id, null); };
         Tip(complexity, "Drum activity; other parts use density");
-        accept = Button("Accept", () => { session.AcceptGeneration(); candidate = null; Reload(); }, true);
-        discard = Button("Discard", () => { ClearCandidate(); Reload(); }, true);
-        audition = Button("Audition", AuditionCandidate, true);
+        accept = Button("Accept", AcceptCandidate);
+        discard = Button("Discard", () => { ClearCandidate(); RefreshNotes(); });
+        audition = Button("Audition", AuditionCandidate);
+        returnAudition = Button("Return", () => session.ReturnFromAudition(CandidateQuantum()));
+        cancelGeneration = Button("Cancel preparation", session.CancelGeneration);
+        prepareSection = AsyncButton("Preview section", PrepareSectionAsync);
+        varySection = AsyncButton("Vary", PrepareVariationAsync);
+        Tip(varySection, "Vary the accepted section with the next seed. Use Preview section to apply edited outline controls.");
+        Tip(candidateBoundary, "Boundary for live audition, return or acceptance");
+        AutomationProperties.SetName(candidateBoundary, "Candidate boundary");
+        Tip(accept, "Commit the candidate. During playback, queue it at the chosen boundary. Cancelling a queued launch does not undo the accepted edit.");
         var outline = Column(Label("Sections", sections), sectionTools, Label("Name", sectionName), Label("Bars", bars), Label("Meter", Row(numerator, denominator)),
             Label("Root", root), Label("Scale", scale), Label("Density", density), Label("Intensity", intensity), Label("Variation", variation), Label("Seed", seed),
             new Expander { Header = "Drummer", Content = Column(Label("Persona", drummer), Label("Complexity", complexity), Label("Fills", fills), Label("Swing", swing), halfTime) },
-            Wrap(Button("Preview section", PrepareSection, true), Button("Vary", () => { seed.Value = ((seed.Value ?? 1) + 1) % 4294967296m; PrepareSection(); }, true)),
-            candidateLabel, Wrap(audition, accept, discard), new Expander { Header = "Part generator", Content = generators });
+            Wrap(prepareSection, varySection, cancelGeneration),
+            candidateLabel, Wrap(candidateBoundary, audition, returnAudition, accept, discard), new Expander { Header = "Part generator", Content = generators });
         Tip(scale, "Pitch-class intervals from the root, separated by commas");
-        stoppedControls.Add(generators);
         generators.Error += ex => status.Text = ex.Message;
-        generators.Prepare += settings => Try(() => PreparePart(settings));
+        generators.Prepare = PreparePartAsync;
 
         parts.SelectionChanged += (_, _) => { if (!loading) { currentPart = null; RefreshNotes(true); } };
-        notes.SelectionChanged += (_, _) => { if (!syncingNotes && notes.SelectedIndex >= 0 && SelectedPart() is { } p && notes.SelectedIndex < p.Pattern.Notes.Length) roll.Select(p.Pattern.Notes[notes.SelectedIndex].Id); };
+        notes.SelectionChanged += (_, _) =>
+        {
+            if (!syncingNotes) roll.SelectMany(notes.SelectedItems?.OfType<NoteChoice>().Select(n => n.Note.Id) ?? []);
+        };
         roll.SelectionChanged += SelectNote;
-        roll.NoteEdited += n => Try(() => { if (SelectedPart() is { } p) { session.EditNote(p.Id, n); RefreshNotes(); roll.Select(n.Id); } });
-        roll.NoteDeleted += id => Try(() => { if (SelectedPart() is { } p) { session.DeleteNote(p.Id, id); RefreshNotes(); } });
+        roll.CommitEdit = CommitNoteEdit;
+        roll.Error += ex => status.Text = ex.Message;
         mode.SelectionChanged += (_, _) => { if (!loading) RefreshNotes(true); };
         snap.SelectionChanged += (_, _) => roll.SnapTicks = snap.SelectedIndex switch { 0 => 960, 1 => 480, 2 => 240, 3 => 120, 4 => 320, 5 => 160, _ => 1 };
         zoom.PropertyChanged += (_, e) => { if (e.Property == Slider.ValueProperty) roll.Zoom = zoom.Value; };
@@ -128,7 +141,10 @@ public sealed class MainWindow : Window
         Grid.SetRow(rollScroll, 1); editor.Children.Add(rollScroll);
         var fields = Wrap(Label("Pitch", pitch), Label("Velocity", velocity), Label("Tick", tick), Label("Duration", duration), locked);
         Grid.SetRow(fields, 2); editor.Children.Add(fields);
-        var edits = Wrap(Button("Apply", ApplyNote, true), Button("Add note", AddNote, true), Button("Delete", DeleteNote, true)); Grid.SetRow(edits, 3); editor.Children.Add(edits);
+        var apply = Button("Apply", ApplyNote, true);
+        Tip(apply, "For a selection, pitch/tick/duration changes are relative. Velocity and lock apply to all selected notes.");
+        var edits = Wrap(apply, Button("Add note", AddNote, true), Button("Delete", DeleteNote, true),
+            Button("All", roll.SelectAll), Button("Copy", roll.Copy), Button("Paste", roll.Paste, true), Button("Duplicate", roll.Duplicate, true), selectedCount); Grid.SetRow(edits, 3); editor.Children.Add(edits);
         var noteList = new Expander { Header = "Notes", Content = notes }; Grid.SetRow(noteList, 4); editor.Children.Add(noteList);
         stoppedControls.Add(mute); stoppedControls.Add(solo); stoppedControls.Add(fields); stoppedControls.Add(patternKind);
         AutomationProperties.SetName(notes, "Note list");
@@ -142,7 +158,7 @@ public sealed class MainWindow : Window
         {
             ["Outline"] = new ScrollViewer { Content = outline }, ["Patterns"] = editor,
             ["Perform"] = new ScrollViewer { Content = Column(activity, Label("Record into", record),
-                Button("Play section", PlaySection, true), Wrap(launchSection, launchBoundary, Button("Queue", QueueSection), Button("Cancel queue", session.CancelQueuedSection)),
+                Button("Play section", PlaySection, true), Wrap(launchSection, launchBoundary, Button("Queue", QueueSection)),
                 arrangement, Label("Takes", takes), takeTools, new Expander { Header = "Bank", Content = BuildBankPane() }) }, ["Routing"] = routing
         });
         Tip(launchSection, "Section to launch; choosing it does not change playback");
@@ -161,7 +177,7 @@ public sealed class MainWindow : Window
         timer.Tick += (_, _) => TryTransport();
         KeyDown += (_, e) =>
         {
-            if (!e.KeyModifiers.HasFlag(KeyModifiers.Control) || e.Key != Key.Z || e.Source is TextBox or NumericUpDown) return;
+            if (e.Handled || !e.KeyModifiers.HasFlag(KeyModifiers.Control) || e.Key != Key.Z || e.Source is TextBox or NumericUpDown) return;
             Try(() => { if (e.KeyModifiers.HasFlag(KeyModifiers.Shift)) session.Redo(); else session.Undo(); ClearCandidate(); Reload(); }); e.Handled = true;
         };
         Closing += (_, _) =>
@@ -228,21 +244,52 @@ public sealed class MainWindow : Window
         new Meter((int)(numerator.Value ?? 4), (int)(denominator.SelectedItem ?? 4)), (int)(root.Value ?? 40),
         (scale.Text ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToImmutableArray(),
         density.Value, intensity.Value, variation.Value, (uint)(seed.Value ?? 1));
-    private void PrepareSection()
+    private Task PrepareSectionAsync()
     {
+        var outline = ReadOutline();
         DrummerSettings? settings = drummer.SelectedIndex > 0 ? new(DrumPersonas.All[drummer.SelectedIndex - 1].Id, complexity.Value, fills.Value, swing.Value, halfTime.IsChecked == true) : null;
-        candidate = session.PrepareGeneration(ReadOutline(), settings, basicDrums: settings is null); RefreshNotes(); UpdateCandidate();
+        return PrepareAsync(() => session.PrepareGenerationAsync(outline, settings, basicDrums: settings is null));
     }
-    private void PreparePart(GeneratorSettings settings)
+    private Task PreparePartAsync(GeneratorSettings settings)
     {
         if (SelectedPart() is not { } part) throw new InvalidOperationException("Choose a part first.");
         if (generators.UseSource) settings = settings with { SourceNotes = part.Pattern.Notes, SourceLengthTicks = DisplaySection.Outline.LengthTicks };
-        candidate = session.PreparePartGeneration(part.Id, settings); RefreshNotes(); UpdateCandidate();
+        return PrepareAsync(() => session.PreparePartGenerationAsync(part.Id, settings));
+    }
+    private Task PrepareVariationAsync()
+    {
+        var next = unchecked((candidate?.Outline.Seed ?? session.SelectedSection.Outline.Seed) + 1);
+        seed.Value = next;
+        return PrepareAsync(() => session.PrepareVariationAsync(next));
+    }
+    private async Task PrepareAsync(Func<Task<Section>> prepare)
+    {
+        try
+        {
+            var pending = prepare(); candidate = session.Candidate; RefreshNotes(); UpdateCandidate();
+            var result = await pending;
+            if (!closing && ReferenceEquals(session.Candidate, result) && session.SelectedSectionId == result.Id)
+            { candidate = result; RefreshNotes(); }
+        }
+        catch (OperationCanceledException) { }
+        finally { if (!closing) UpdateCandidate(); }
+    }
+    private long CandidateQuantum()
+    {
+        var meter = PlayingPosition(session.Status()).Section.Outline.Meter;
+        return candidateBoundary.SelectedIndex == 1 ? MusicalTime.Ppq * 4L / meter.Denominator : meter.BarTicks;
+    }
+    private void AcceptCandidate()
+    {
+        session.AcceptGeneration(session.Status().Running ? CandidateQuantum() : 0);
+        candidate = null; Reload();
     }
     private void AuditionCandidate()
     {
         if (candidate is null) return;
-        auditionSection = candidate; playback = "candidate"; session.StartCandidate(loop.IsChecked == true);
+        auditionSection = candidate;
+        if (session.Status().Running) session.AuditionCandidate(CandidateQuantum());
+        else { auditionSection = candidate; playback = "candidate"; session.StartCandidate(loop.IsChecked == true); }
     }
     private void PlaySection()
     {
@@ -251,16 +298,28 @@ public sealed class MainWindow : Window
     private void QueueSection()
     {
         if (launchSection.SelectedItem is not Choice { Id: { } id }) throw new InvalidOperationException("Choose a section to launch.");
-        var meter = PlayingPosition(session.Status().Tick, session.PlayingSectionId).Section.Outline.Meter;
+        var meter = PlayingPosition(session.Status()).Section.Outline.Meter;
         session.QueueSection(id, launchBoundary.SelectedIndex == 1 ? MusicalTime.Ppq * 4L / meter.Denominator : meter.BarTicks);
     }
     private void ClearCandidate() { candidate = null; session.DiscardGeneration(); UpdateCandidate(); }
     private Section DisplaySection => candidate ?? session.SelectedSection;
     private void UpdateCandidate()
     {
-        candidateLabel.Text = candidate is null ? "" : "Candidate";
-        accept.IsEnabled = discard.IsEnabled = audition.IsEnabled = candidate is not null && !session.Status().Running;
-        roll.ReadOnly = candidate is not null || session.Status().Running;
+        var progress = session.GenerationStatus; var running = session.Status().Running;
+        var preparing = progress.Phase == GenerationPhase.Preparing;
+        candidateLabel.Text = progress.Phase switch
+        {
+            GenerationPhase.Preparing => "Preparing…", GenerationPhase.Ready => "Candidate", GenerationPhase.Cancelled => "Cancelled",
+            GenerationPhase.Failed => progress.Error, _ => ""
+        };
+        cancelGeneration.IsVisible = preparing;
+        prepareSection.IsEnabled = varySection.IsEnabled = !preparing;
+        generators.IsPreparing = preparing;
+        accept.IsEnabled = candidate is not null && (!running || session.PlayingSectionId == candidate.Id && session.Armed is null);
+        discard.IsEnabled = candidate is not null || preparing;
+        audition.IsEnabled = candidate is not null && (!running || session.PlayingSectionId == candidate.Id && session.Armed is null);
+        returnAudition.IsEnabled = running && session.AuditionStatus.Phase is AuditionPhase.Queued or AuditionPhase.Playing;
+        roll.ReadOnly = candidate is not null || running;
     }
     private void Reload()
     {
@@ -299,10 +358,10 @@ public sealed class MainWindow : Window
         try
         {
             if (changed) mode.SelectedIndex = p?.Role == PartRole.Drums ? 1 : 0;
-            roll.Show(p, DisplaySection.Outline, mode.SelectedIndex == 1);
+            roll.Show(p, DisplaySection.Outline, mode.SelectedIndex == 1, DisplaySection.Id);
             syncingNotes = true;
-            notes.ItemsSource = p?.Pattern.Notes.Select(n => $"{n.Tick}   {NoteEditor.PitchLabel(n.Pitch)}   v{n.Velocity}   {n.Duration}{(n.Locked ? "   locked" : "")}").ToArray();
-            notes.SelectedIndex = p is null ? -1 : Array.FindIndex(p.Pattern.Notes.ToArray(), n => n.Id == roll.SelectedId);
+            notes.ItemsSource = p?.Pattern.Notes.Select(n => new NoteChoice(n)).ToArray();
+            SyncNoteList();
             syncingNotes = false;
             mute.IsChecked = p?.Muted == true; solo.IsChecked = p?.Solo == true; patternKind.SelectedItem = p?.Pattern.Kind;
             var settings = p?.Pattern.Recipe?.Settings;
@@ -314,46 +373,48 @@ public sealed class MainWindow : Window
         revision = session.Revision;
         UpdateCandidate();
     }
-    private MidiNote? SelectedNote() => SelectedPart()?.Pattern.Notes.FirstOrDefault(n => n.Id == roll.SelectedId);
+    private sealed record NoteChoice(MidiNote Note)
+    {
+        public override string ToString() => $"{Note.Tick}   {NoteEditor.PitchLabel(Note.Pitch)}   v{Note.Velocity}   {Note.Duration}{(Note.Locked ? "   locked" : "")}";
+    }
+    private void SyncNoteList()
+    {
+        var ids = roll.SelectedIds.ToHashSet(StringComparer.Ordinal);
+        notes.SelectedItems?.Clear();
+        if (notes.ItemsSource is IEnumerable<NoteChoice> choices)
+            foreach (var choice in choices.Where(n => ids.Contains(n.Note.Id))) notes.SelectedItems?.Add(choice);
+        selectedCount.Text = ids.Count == 0 ? "" : $"{ids.Count} selected";
+    }
     private void SelectNote(MidiNote? n)
     {
-        if (n is null) return;
-        pitch.Value = n.Pitch; velocity.Value = n.Velocity; tick.Value = n.Tick; duration.Value = n.Duration; locked.IsChecked = n.Locked;
+        if (n is not null)
+        { pitch.Value = n.Pitch; velocity.Value = n.Velocity; tick.Value = n.Tick; duration.Value = n.Duration; locked.IsChecked = n.Locked; }
         syncingNotes = true;
-        if (SelectedPart() is { } p) notes.SelectedIndex = Array.FindIndex(p.Pattern.Notes.ToArray(), v => v.Id == n.Id);
-        syncingNotes = false;
+        try { SyncNoteList(); } finally { syncingNotes = false; }
     }
     private MidiNote Edited(string id) => new(id, (long)(tick.Value ?? 0), (long)(duration.Value ?? 240), (int)(pitch.Value ?? 60), (int)(velocity.Value ?? 90), locked.IsChecked == true);
-    private void ApplyNote()
+    private bool CommitNoteEdit(NoteEdit edit)
     {
-        if (candidate is not null) throw new InvalidOperationException("Accept or discard the candidate before editing.");
-        if (SelectedPart() is not { } p || SelectedNote() is not { } n) return;
-        session.EditNote(p.Id, Edited(n.Id)); RefreshNotes(); roll.Select(n.Id);
+        try
+        {
+            if (candidate is not null) throw new InvalidOperationException("Accept or discard the candidate before editing.");
+            if (SelectedPart() is not { } part) return false;
+            session.EditNotes(part.Id, edit.Upserts, edit.DeleteIds); RefreshNotes(); status.Text = ""; return true;
+        }
+        catch (Exception ex) { status.Text = ex.Message; return false; }
     }
-    private void AddNote()
-    {
-        if (candidate is not null) throw new InvalidOperationException("Accept or discard the candidate before editing.");
-        if (SelectedPart() is not { } p) return;
-        var note = Edited(Guid.NewGuid().ToString("N")) with { Locked = true }; session.EditNote(p.Id, note); RefreshNotes(); roll.Select(note.Id);
-    }
-    private void DeleteNote()
-    {
-        if (candidate is not null) throw new InvalidOperationException("Accept or discard the candidate before editing.");
-        if (SelectedPart() is not { } p || SelectedNote() is not { } n) return;
-        session.DeleteNote(p.Id, n.Id); RefreshNotes();
-    }
+    private void ApplyNote() { if (roll.SelectedId is { } id) roll.ApplyFields(Edited(id)); }
+    private void AddNote() => roll.Add(Edited(Guid.NewGuid().ToString("N")) with { Locked = true });
+    private void DeleteNote() => roll.DeleteSelection();
     private void TryTransport()
     {
         try { RefreshTransport(); } catch (Exception ex) { status.Text = ex.Message; }
     }
-    private (Section Section, double Position) PlayingPosition(double tick, string? activeSectionId)
+    private (Section Section, double Position) PlayingPosition(SessionStatus transport)
     {
+        var tick = transport.Tick;
+        if (transport.PlayingSection is { } sounding) return (sounding, tick);
         var project = session.Project;
-        if (activeSectionId is not null)
-        {
-            if (playback == "candidate" && auditionSection is { } preview && preview.Id == activeSectionId) return (preview, tick);
-            if (project.Sections.FirstOrDefault(s => s.Id == activeSectionId) is { } active) return (active, tick);
-        }
         var section = session.SelectedSection;
         if (playback == "song" && session.Armed is null)
         {
@@ -373,23 +434,30 @@ public sealed class MainWindow : Window
     {
         var s = session.Status();
         if (s.Revision != revision) { candidate = null; Reload(); }
-        var activeSectionId = session.PlayingSectionId;
-        var (section, position) = PlayingPosition(s.Tick, activeSectionId);
-        var playingTake = playback == "take" && activeSectionId is null;
+        var (section, position) = PlayingPosition(s);
+        var playingTake = playback == "take" && s.PlayingSection is null;
         var meter = playingTake ? replayingTake?.Meter ?? section.Outline.Meter : section.Outline.Meter;
         var unit = MusicalTime.Ppq * 4d / meter.Denominator;
         beat.Text = s.Running ? $"{(long)(position / meter.BarTicks) + 1}:{(int)(position / unit) % meter.Numerator + 1}  {meter.Numerator}/{meter.Denominator}" : "Stopped";
         Tip(beat, s.Running ? section.Outline.Name : "Bar and beat within the playing section");
         pulse.Update(meter, position, s.Running);
-        roll.Playhead = s.Running && !playingTake && section.Id == DisplaySection.Id ? position : -1;
+        roll.Playhead = s.Running && !playingTake && ReferenceEquals(section, DisplaySection) ? position : -1;
         foreach (var c in stoppedControls) c.IsEnabled = !s.Running;
         sections.IsEnabled = !s.Running || session.Armed is null;
         play.Content = session.Armed is null ? "Play song" : "Record section";
         Tip(play, session.Armed is null ? "Play the song order" : "Record the routing input into the selected section");
         roll.ReadOnly = s.Running || candidate is not null;
         undo.IsEnabled = !s.Running && session.CanUndo; redo.IsEnabled = !s.Running && session.CanRedo;
-        accept.IsEnabled = discard.IsEnabled = audition.IsEnabled = candidate is not null && !s.Running;
-        mute.IsEnabled = solo.IsEnabled = patternKind.IsEnabled = !s.Running && candidate is null;
+        if (!ReferenceEquals(candidate, session.Candidate)) { candidate = session.Candidate; RefreshNotes(); }
+        UpdateCandidate();
+        var auditionProgress = session.AuditionStatus;
+        cancelQueued.IsEnabled = s.Running;
+        queuedStatus.Text = auditionProgress.Phase switch
+        {
+            AuditionPhase.Queued => "Audition queued", AuditionPhase.Playing => "Audition", AuditionPhase.Returning => "Return queued", _ => ""
+        };
+        patternKind.IsEnabled = !s.Running && candidate is null;
+        mute.IsEnabled = solo.IsEnabled = candidate is null && (!s.Running || session.Armed is null && s.PlayingSection?.Id == session.SelectedSectionId);
         activity.Text = $"{s.CapturedEvents} events · {s.LateNotes} late" + (s.DroppedInputs > 0 ? $" · {s.DroppedInputs} inputs dropped" : "") + (s.SkippedClocks > 0 ? $" · {s.SkippedClocks} clocks skipped" : "");
         if (transportWasRunning && !s.Running) { Reload(); RefreshTakes(); }
         transportWasRunning = s.Running;

@@ -12,10 +12,10 @@ Accepted notes are saved with their generator recipes. Opening a project does no
 ## Implemented
 
 - Sections, song order and repeats; song banks and setlists; undo/redo.
-- Piano roll and drum grid with snapped note creation, moving, resizing, deletion, velocity and locks.
+- Piano roll and drum grid with multi-note selection, group moves/resizing, copy/paste, duplication, velocity and locks.
 - Step sequencer, arpeggiator, Euclidean rhythm, stochastic, random-walk, chord and pad generators. Settings include scale/range, gate, probability, ratchets, swing and source phrases.
 - Synthetic drummer ported from MusicSessionTrace, nine personas, explicit grouping for odd meters and versioned recipes.
-- Separate generation candidates with audition, acceptance and scoped part generation.
+- Background generation and seeded variation with cancellation, scoped candidates, live audition/return and boundary acceptance.
 - MIDI routing, channel overrides, clock-only outputs, endpoint delays, Stop and Panic.
 - Quantized section launching and live section mute/solo. Selecting a section never launches it.
 - Keyboard input, thru, loop overdub and protected recorded notes.
@@ -51,7 +51,9 @@ Or `bash scripts/publish.sh win-x64`. Output is under `artifacts/win-x64/`. Run 
 3. Patterns: click empty space to add a note; drag it to move, or drag its right edge to resize. Right-click/Delete removes. Locked notes survive regeneration. Pattern kind explicitly controls Fixed/Hybrid/Generative behavior.
 4. Perform: arm a part or New part, then play the section. Stop commits keyboard notes. Arm changes require stopped playback.
 5. Arrange sections with repeats or queue a section at a beat/bar boundary. Song banks hold reusable project snapshots and setlist order.
-6. Save the project, export the song as MIDI, or recall a captured take. Completed takes are retained separately from later performances.
+6. Save the project, export the song as MIDI, or recall a captured take. A DAW or MusicSessionTrace can capture the performance; built-in recording remains available for phrase development.
+
+See [live generation and editing](docs/live-generation.md) for audition, variation, cancellation and keyboard controls.
 
 Arpeggiators can use captured notes as their source. Generator settings preserve that material in the recipe. Change only the part you intend to vary; Fixed material remains protected until explicitly converted.
 
@@ -60,6 +62,7 @@ Arpeggiators can use captured notes as their source. Generator settings preserve
 ```sh
 dotnet run --project src/MidiWorkbench.Cli -- new song.midiwork.json
 dotnet run --project src/MidiWorkbench.Cli -- sections song.midiwork.json
+dotnet run --project src/MidiWorkbench.Cli -- vary song.midiwork.json section-1 42 variation.midiwork.json
 dotnet run --project src/MidiWorkbench.Cli -- simulate-song song.midiwork.json take.json
 dotnet run --project src/MidiWorkbench.Cli -- export-song song.midiwork.json song.mid
 dotnet run --project src/MidiWorkbench.Cli -- validate-take take.json

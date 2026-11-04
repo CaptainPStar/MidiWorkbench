@@ -8,7 +8,14 @@ using MidiWorkbench.Persistence;
 namespace MidiWorkbench.Application;
 
 public sealed record SessionStatus(bool Running, double Tick, int CapturedEvents, bool CaptureComplete, long LateNotes,
-    long SkippedClocks, long DroppedInputs, string? Error, long Revision);
+    long SkippedClocks, long DroppedInputs, string? Error, long Revision)
+{
+    public Section? PlayingSection { get; init; }
+}
+public enum GenerationPhase { Idle, Preparing, Ready, Cancelled, Failed }
+public enum AuditionPhase { Idle, Queued, Playing, Returning }
+public sealed record AuditionProgress(AuditionPhase Phase, string? SectionId = null);
+public sealed record GenerationProgress(long RequestId, GenerationPhase Phase, string? SectionId = null, string? Error = null);
 public sealed record SessionOptions(IMidiBackend? Backend = null, string? RigPath = null, HostOptions? Host = null, string? TakeDirectory = null);
 
 // Owns project state and device lifetimes. Playback runs on TransportHost's worker; nothing here blocks it.
@@ -46,13 +53,54 @@ public sealed class WorkbenchSession : IDisposable
     private string selectedSectionId;
     private SongProject? preparedFrom;
     private Section? prepared;
+    private CancellationTokenSource? generationCancellation;
+    private readonly SemaphoreSlim generationWorker = new(1, 1);
+    private long generationRequest;
+    private bool disposed;
+    private GenerationProgress generationStatus = new(0, GenerationPhase.Idle);
+    public GenerationProgress GenerationStatus { get { lock (gate) return generationStatus; } }
+    public Section? Candidate { get { lock (gate) return prepared; } }
+    private void InvalidateGeneration()
+    {
+        generationRequest++;
+        generationCancellation?.Cancel();
+        generationCancellation = null;
+        prepared = null; preparedFrom = null;
+        generationStatus = new(generationRequest, GenerationPhase.Idle);
+    }
+    private void EnsureOpen() { ObjectDisposedException.ThrowIf(disposed, this); }
     private readonly Stack<SongProject> undo = new(), redo = new();
     private readonly List<PerformanceTake> takes = new();
     private long archivedTake;
     private Meter? captureMeter;
     private string? captureProjectId, captureProjectName, captureInput, captureDestination, captureEndpoint;
-    private string? playingSectionId;
-    public string? PlayingSectionId { get { lock (gate) { var status = host.Status; return status.Running ? status.ActivePlanTag ?? playingSectionId : null; } } }
+    private readonly Dictionary<string, Section> planSections = new(StringComparer.Ordinal);
+    private Section? PlayingSectionFor(TransportStatus status) =>
+        status.Running && status.ActivePlanTag is { } tag && planSections.TryGetValue(tag, out var section) ? section : null;
+    public Section? PlayingSection { get { lock (gate) return PlayingSectionFor(host.Status); } }
+    private ResolvedPlan TagSection(ResolvedPlan plan, Section section, string? tag = null)
+    {
+        tag ??= "plan-" + Guid.NewGuid().ToString("N");
+        if (!host.Status.Running) planSections.Clear();
+        planSections[tag] = section;
+        return plan with { Tag = tag };
+    }
+    private readonly Dictionary<string, string> auditionTags = new(StringComparer.Ordinal);
+    private string? auditionTag, auditionSectionId;
+    private bool auditionQueued, auditionReturning;
+    private string? ActiveSection(TransportStatus status) => PlayingSectionFor(status)?.Id;
+    public string? PlayingSectionId { get { lock (gate) return PlayingSectionFor(host.Status)?.Id; } }
+    public AuditionProgress AuditionStatus
+    {
+        get { lock (gate) {
+            var status = host.Status;
+            if (!status.Running) return new(AuditionPhase.Idle);
+            if (auditionQueued && status.ActivePlanTag != auditionTag) return new(AuditionPhase.Queued, auditionSectionId);
+            if (status.ActivePlanTag is { } tag && auditionTags.TryGetValue(tag, out var id))
+                return new(auditionReturning ? AuditionPhase.Returning : AuditionPhase.Playing, id);
+            return new(AuditionPhase.Idle);
+        } }
+    }
     private Dictionary<string, string> captureEndpointDestinations = new(StringComparer.Ordinal);
     public string SelectedSectionId { get { lock (gate) return selectedSectionId; } }
     public Section SelectedSection { get { lock (gate) return project.Sections[SectionIndex]; } }
@@ -63,12 +111,13 @@ public sealed class WorkbenchSession : IDisposable
     private void RequireStopped() { if (Running) throw new InvalidOperationException("Stop playback first."); }
     private void Apply(SongProject value)
     {
-        value.Validate(); undo.Push(project); redo.Clear(); project = value; revision++;
-        prepared = null; preparedFrom = null;
+        value.Validate(); CancelDiscardedAudition(returnPlaying: true);
+        undo.Push(project); redo.Clear(); project = value; revision++;
+        InvalidateGeneration();
     }
     public void SelectSection(string id)
     {
-        lock (gate) { if (Running && armed is not null) throw new InvalidOperationException("Stop recording before selecting a section."); if (!project.Sections.Any(s => s.Id == id)) throw new ArgumentException("Unknown section."); if (!Running) { CommitRecording(); Await(host.Arm(null, 1)); armed = null; } selectedSectionId = id; }
+        lock (gate) { if (Running && armed is not null) throw new InvalidOperationException("Stop recording before selecting a section."); if (!project.Sections.Any(s => s.Id == id)) throw new ArgumentException("Unknown section."); if (id != selectedSectionId) { CancelDiscardedAudition(returnPlaying: true); InvalidateGeneration(); } if (!Running) { CommitRecording(); Await(host.Arm(null, 1)); armed = null; } selectedSectionId = id; }
     }
     public string AddSection()
     {
@@ -104,7 +153,7 @@ public sealed class WorkbenchSession : IDisposable
     {
         lock (gate) { RequireStopped(); CommitRecording(); if (from.Count == 0) return; to.Push(project); project = from.Pop();
             if (!project.Sections.Any(s => s.Id == selectedSectionId)) selectedSectionId = project.Sections[0].Id;
-            prepared = null; preparedFrom = null; revision++; }
+            InvalidateGeneration(); revision++; }
     }
 
     public SongProject Project { get { lock (gate) return project; } }
@@ -148,38 +197,204 @@ public sealed class WorkbenchSession : IDisposable
     public IReadOnlyList<MidiEndpoint> Endpoints() => backend.Endpoints();
     private bool Running => host.Status.Running;
 
-    public Section PrepareGeneration(Outline outline, DrummerSettings? drummer = null, bool basicDrums = false)
+    public Section PrepareGeneration(Outline outline, DrummerSettings? drummer = null, bool basicDrums = false) =>
+        PrepareGenerationAsync(outline, drummer, basicDrums).GetAwaiter().GetResult();
+    public Task<Section> PrepareGenerationAsync(Outline outline, DrummerSettings? drummer = null, bool basicDrums = false,
+        CancellationToken cancellationToken = default) => PrepareAsync((section, token) =>
     {
-        SongProject snapshot; string sectionId;
-        lock (gate) { RequireStopped(); CommitRecording(); snapshot = project; sectionId = selectedSectionId; }
-        var previous = snapshot.Sections.First(s => s.Id == sectionId);
-        var section = new SectionGenerator().Generate(outline, previous, drummer, basicDrums);
-        section = section with { Parts = section.Parts.Select(p => previous.Parts.FirstOrDefault(old => old.Id == p.Id) is { } old ? p with { Muted = old.Muted, Solo = old.Solo } : p).ToImmutableArray() };
-        lock (gate) { if (Running || !ReferenceEquals(project, snapshot) || sectionId != selectedSectionId) throw new InvalidOperationException("Project changed during generation; retry.");
-            preparedFrom = snapshot; prepared = section; return section; }
+        token.ThrowIfCancellationRequested();
+        var result = new SectionGenerator().Generate(outline, section, drummer, basicDrums);
+        token.ThrowIfCancellationRequested();
+        return result with { Parts = result.Parts.Select(p => section.Parts.FirstOrDefault(old => old.Id == p.Id) is { } old
+            ? p with { Muted = old.Muted, Solo = old.Solo } : p).ToImmutableArray() };
+    }, cancellationToken);
+    public Task<Section> PrepareVariationAsync(uint seed, DrummerSettings? drummer = null, bool basicDrums = false,
+        CancellationToken cancellationToken = default)
+    {
+        return PrepareAsync((section, token) =>
+        {
+            token.ThrowIfCancellationRequested();
+            var generators = new Dictionary<string, GeneratorSettings>(StringComparer.Ordinal);
+            foreach (var part in section.Parts)
+            {
+                token.ThrowIfCancellationRequested();
+                if (part.Pattern.Kind == PatternKind.Fixed || part.Pattern.Recipe is not { Generator: PatternGenerator.GeneratorId } recipe) continue;
+                PatternGenerator.ValidateRecipe(recipe);
+                generators.Add(part.Id, recipe.Settings! with { Seed = VariationSeed(seed, part.Id) });
+            }
+            var result = new SectionGenerator().Generate(section.Outline with { Seed = seed }, section, drummer, basicDrums, generators);
+            token.ThrowIfCancellationRequested();
+            return result with { Parts = result.Parts.Select(p => section.Parts.FirstOrDefault(old => old.Id == p.Id) is { } old
+                ? p with { Muted = old.Muted, Solo = old.Solo } : p).ToImmutableArray() };
+        }, cancellationToken);
     }
-    public Section PreparePartGeneration(string partId, GeneratorSettings settings)
+    private static uint VariationSeed(uint seed, string partId)
     {
-        SongProject snapshot; string id; Part part; Section section;
+        unchecked
+        {
+            var hash = 2166136261u ^ seed;
+            foreach (var c in partId) { hash ^= c; hash *= 16777619u; }
+            return hash;
+        }
+    }
+    public Task<Section> PreparePartVariationAsync(string partId, GeneratorSettings settings, uint seed, CancellationToken cancellationToken = default) =>
+        PreparePartGenerationAsync(partId, settings with { Seed = seed }, cancellationToken);
+    public Section PreparePartGeneration(string partId, GeneratorSettings settings) =>
+        PreparePartGenerationAsync(partId, settings).GetAwaiter().GetResult();
+    public Task<Section> PreparePartGenerationAsync(string partId, GeneratorSettings settings, CancellationToken cancellationToken = default) =>
+        PrepareAsync((section, token) =>
+        {
+            token.ThrowIfCancellationRequested();
+            var part = section.Parts.FirstOrDefault(p => p.Id == partId) ?? throw new ArgumentException("Unknown part.");
+            var pattern = new PatternGenerator().Generate(section.Outline, settings, part.Pattern);
+            token.ThrowIfCancellationRequested();
+            return section with { Parts = section.Parts.Select(p => p.Id == partId ? p with { Pattern = pattern } : p).ToImmutableArray() };
+        }, cancellationToken);
+    private async Task<Section> PrepareAsync(Func<Section, CancellationToken, Section> generate, CancellationToken cancellationToken)
+    {
+        SongProject snapshot; Section section; long request; CancellationTokenSource source; CancellationToken token;
         lock (gate)
         {
-            RequireStopped(); CommitRecording(); snapshot = project; id = selectedSectionId; section = project.Sections[SectionIndex];
-            part = section.Parts.FirstOrDefault(p => p.Id == partId) ?? throw new ArgumentException("Unknown part.");
+            EnsureOpen();
+            if (!Running) CommitRecording();
+            CancelDiscardedAudition(returnPlaying: false);
+            InvalidateGeneration();
+            snapshot = project; section = project.Sections[SectionIndex]; request = generationRequest;
+            source = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            generationCancellation = source; token = source.Token;
+            generationStatus = new(request, GenerationPhase.Preparing, section.Id);
         }
-        var pattern = new PatternGenerator().Generate(section.Outline, settings, part.Pattern);
-        var candidate = section with { Parts = section.Parts.Select(p => p.Id == partId ? p with { Pattern = pattern } : p).ToImmutableArray() };
+        try
+        {
+            var computation = Task.Run(async () =>
+            {
+                await generationWorker.WaitAsync(token).ConfigureAwait(false);
+                try { token.ThrowIfCancellationRequested(); return generate(section, token); }
+                finally { generationWorker.Release(); }
+            });
+            _ = computation.ContinueWith(t => _ = t.Exception, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            var result = await computation.WaitAsync(token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            (snapshot with { Sections = snapshot.Sections.SetItem(Array.FindIndex(snapshot.Sections.ToArray(), s => s.Id == section.Id), result) }).Validate();
+            lock (gate)
+            {
+                if (disposed || request != generationRequest || !ReferenceEquals(project, snapshot) || selectedSectionId != section.Id || token.IsCancellationRequested)
+                    throw new OperationCanceledException("Generation was superseded.");
+                prepared = result; preparedFrom = snapshot; generationCancellation = null;
+                generationStatus = new(request, GenerationPhase.Ready, section.Id); return result;
+            }
+        }
+        catch (Exception ex)
+        {
+            lock (gate)
+            {
+                if (request == generationRequest)
+                {
+                    generationCancellation = null;
+                    generationStatus = new(request, ex is OperationCanceledException ? GenerationPhase.Cancelled : GenerationPhase.Failed,
+                        section.Id, ex is OperationCanceledException ? null : ex.Message);
+                }
+            }
+            throw;
+        }
+        finally { source.Dispose(); }
+    }
+    public void CancelGeneration()
+    {
         lock (gate)
         {
-            if (Running || !ReferenceEquals(project, snapshot) || id != selectedSectionId) throw new InvalidOperationException("Project changed during generation; retry.");
-            prepared = candidate; preparedFrom = snapshot; return candidate;
+            if (generationCancellation is null) return;
+            var id = generationRequest; var sectionId = generationStatus.SectionId;
+            generationRequest++; generationCancellation.Cancel(); generationCancellation = null;
+            generationStatus = new(id, GenerationPhase.Cancelled, sectionId);
         }
     }
-    public void AcceptGeneration()
+    public void AcceptGeneration() => AcceptGeneration(0);
+    // The project changes when acceptance succeeds; cancelling its queued launch does not undo the edit.
+    public void AcceptGeneration(long quantumTicks)
     {
-        lock (gate) { RequireStopped(); if (prepared is null || !ReferenceEquals(preparedFrom, project) || prepared.Id != selectedSectionId) throw new InvalidOperationException("No current candidate.");
-            Apply(project with { Sections = project.Sections.SetItem(SectionIndex, prepared) }); }
+        lock (gate)
+        {
+            EnsureOpen();
+            if (prepared is null || !ReferenceEquals(preparedFrom, project) || prepared.Id != selectedSectionId) throw new InvalidOperationException("No current candidate.");
+            var candidate = project with { Sections = project.Sections.SetItem(SectionIndex, prepared) };
+            candidate.Validate();
+            if (Running)
+            {
+                if (armed is not null) throw new InvalidOperationException("Stop recording before accepting a candidate.");
+                if (ActiveSection(host.Status) != prepared.Id) throw new InvalidOperationException("Live acceptance requires the playing section; arrangement playback is not supported.");
+                if (quantumTicks <= 0) throw new ArgumentOutOfRangeException(nameof(quantumTicks), "Choose a beat or bar boundary.");
+                var temporary = candidate with { Sections = [prepared], Arrangement = [] };
+                var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), prepared);
+                QueueResolved(plan, quantumTicks);
+                auditionQueued = false;
+                auditionReturning = host.Status.ActivePlanTag is { } activeTag && auditionTags.ContainsKey(activeTag);
+            }
+            Apply(candidate);
+        }
     }
-    public void DiscardGeneration() { lock (gate) { prepared = null; preparedFrom = null; } }
+    public void AuditionCandidate(long quantumTicks)
+    {
+        lock (gate)
+        {
+            EnsureOpen();
+            if (!Running || armed is not null) throw new InvalidOperationException("Play a section without recording to audition.");
+            if (prepared is null || !ReferenceEquals(preparedFrom, project) || prepared.Id != selectedSectionId) throw new InvalidOperationException("No current candidate.");
+            if (ActiveSection(host.Status) != prepared.Id) throw new InvalidOperationException("Audition requires the playing section; arrangement playback is not supported.");
+            if (quantumTicks <= 0) throw new ArgumentOutOfRangeException(nameof(quantumTicks));
+            var temporary = project with { Sections = [prepared], Arrangement = [] };
+            var tag = "audition-" + Guid.NewGuid().ToString("N");
+            var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), prepared, tag);
+            QueueResolved(plan, quantumTicks);
+            var currentTag = host.Status.ActivePlanTag;
+            foreach (var old in auditionTags.Keys.Where(key => key != currentTag).ToArray()) auditionTags.Remove(old);
+            auditionTags[tag] = prepared.Id; auditionTag = tag; auditionSectionId = prepared.Id;
+            auditionQueued = true; auditionReturning = false;
+        }
+    }
+    public void ReturnFromAudition(long quantumTicks)
+    {
+        lock (gate)
+        {
+            EnsureOpen();
+            if (!Running) throw new InvalidOperationException("Playback is stopped.");
+            if (quantumTicks <= 0) throw new ArgumentOutOfRangeException(nameof(quantumTicks));
+            var activeTag = host.Status.ActivePlanTag;
+            if (activeTag is null || !auditionTags.TryGetValue(activeTag, out var id))
+            {
+                if (!auditionQueued) throw new InvalidOperationException("No audition is playing or queued.");
+                Await(host.CancelQueuedPlan()); auditionQueued = false; auditionTag = null; auditionSectionId = null; return;
+            }
+            var section = project.Sections.FirstOrDefault(s => s.Id == id) ?? throw new InvalidOperationException("Audition section is unavailable.");
+            var temporary = project with { Sections = [section], Arrangement = [] };
+            var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), section);
+            QueueResolved(plan, quantumTicks);
+            auditionQueued = false; auditionReturning = true;
+        }
+    }
+    private void CancelDiscardedAudition(bool returnPlaying)
+    {
+        if (!Running) { auditionQueued = false; return; }
+        var tag = host.Status.ActivePlanTag;
+        if (auditionQueued && tag != auditionTag)
+        {
+            Await(host.CancelQueuedPlan()); auditionQueued = false;
+        }
+        if (returnPlaying && tag is not null && auditionTags.TryGetValue(tag, out var id) && !auditionReturning)
+        {
+            var section = project.Sections.FirstOrDefault(s => s.Id == id) ?? throw new InvalidOperationException("Audition section is unavailable.");
+            var temporary = project with { Sections = [section], Arrangement = [] };
+            var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), section);
+            var beat = MusicalTime.Ppq * 4L / section.Outline.Meter.Denominator;
+            QueueResolved(plan, beat);
+            auditionQueued = false; auditionReturning = true;
+        }
+    }
+    public void DiscardGeneration()
+    {
+        lock (gate) { CancelDiscardedAudition(returnPlaying: true); InvalidateGeneration(); }
+    }
     public void Generate(Outline outline, DrummerSettings? drummer = null, bool basicDrums = false)
     { PrepareGeneration(outline, drummer, basicDrums); AcceptGeneration(); }
     public void RegeneratePart(string partId, GeneratorSettings settings)
@@ -213,9 +428,25 @@ public sealed class WorkbenchSession : IDisposable
             var candidate = project with { Sections = project.Sections.SetItem(SectionIndex, updated) };
             candidate.Validate();
             var temporary = candidate with { Sections = [updated], Arrangement = [] };
-            var plan = ResolveProjectPlan(ArrangementCompiler.Compile(temporary)) with { Tag = section.Id };
-            Await(host.QueuePlan(plan, PlanPorts(plan, false), section.Outline.Meter.BarTicks));
+            var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), updated);
+            QueueResolved(plan, section.Outline.Meter.BarTicks);
+            auditionQueued = false;
+            auditionReturning = host.Status.ActivePlanTag is { } activeTag && auditionTags.ContainsKey(activeTag);
             Apply(candidate);
+        }
+    }
+    public void EditNotes(string partId, IEnumerable<MidiNote> upserts, IEnumerable<string> deleteIds)
+    {
+        ArgumentNullException.ThrowIfNull(upserts); ArgumentNullException.ThrowIfNull(deleteIds);
+        lock (gate)
+        {
+            RequireStopped();
+            var section = project.Sections[SectionIndex];
+            var part = section.Parts.FirstOrDefault(p => p.Id == partId) ?? throw new ArgumentException("Unknown part.");
+            var pattern = NoteSelectionEdits.Apply(part.Pattern, upserts, deleteIds, section.Outline.LengthTicks);
+            if (ReferenceEquals(pattern, part.Pattern)) return;
+            var changed = section with { Parts = section.Parts.Select(p => p.Id == partId ? p with { Pattern = pattern } : p).ToImmutableArray() };
+            Apply(project with { Sections = project.Sections.SetItem(SectionIndex, changed) });
         }
     }
     public void EditNote(string partId, MidiNote note) => ChangePart(partId, part => part with
@@ -270,8 +501,20 @@ public sealed class WorkbenchSession : IDisposable
         }
         return result;
     }
+    private void ResetAudition()
+    {
+        auditionTags.Clear(); auditionTag = null; auditionSectionId = null;
+        auditionQueued = false; auditionReturning = false;
+    }
+    private void QueueResolved(ResolvedPlan plan, long quantumTicks)
+    {
+        Await(host.QueuePlan(plan, PlanPorts(plan, false), quantumTicks));
+        var active = host.Status.ActivePlanTag;
+        foreach (var old in planSections.Keys.Where(key => key != active && key != plan.Tag).ToArray()) planSections.Remove(old);
+    }
     private void SnapshotCaptureSource()
     {
+        ResetAudition();
         captureProjectId = project.Id; captureProjectName = project.Name; captureInput = rig.Input;
         captureEndpointDestinations = rig.Routes.GroupBy(r => r.EndpointId, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First().Destination, StringComparer.Ordinal);
         captureDestination = armed == NewPhrase ? PhraseDestination : project.Sections[SectionIndex].Parts.FirstOrDefault(p => p.Id == armed)?.Destination;
@@ -285,13 +528,13 @@ public sealed class WorkbenchSession : IDisposable
             CommitRecording();
             ArchiveTake();
             var playback = armed is null ? ArrangementCompiler.Compile(project) : ArrangementCompiler.Compile(project with { Sections = [project.Sections[SectionIndex]], Arrangement = [] });
-            var plan = ResolveProjectPlan(playback) with { Tag = armed is null ? null : selectedSectionId };
+            var plan = ResolveProjectPlan(playback);
+            if (armed is not null) plan = TagSection(plan, project.Sections[SectionIndex]);
             var ports = PlanPorts(plan, true);
             notice = null;
             captureMeter = armed is null ? project.Sections.First(s => s.Id == (project.Arrangement.IsEmpty ? project.Sections[0].Id : project.Arrangement[0].SectionId)).Outline.Meter : project.Sections[SectionIndex].Outline.Meter;
             SnapshotCaptureSource();
             Await(host.Start(plan, ports, project.Bpm, loop));
-            playingSectionId = armed is not null ? selectedSectionId : null;
         }
     }
     public void StartSection(bool repeat = false) => StartSection(SelectedSectionId, repeat);
@@ -303,10 +546,10 @@ public sealed class WorkbenchSession : IDisposable
             var section = project.Sections.FirstOrDefault(s => s.Id == id) ?? throw new ArgumentException("Unknown section.");
             if (armed is not null && id != selectedSectionId) throw new InvalidOperationException("Recording target belongs to the selected section.");
             var temporary = project with { Sections = [section], Arrangement = [] };
-            var plan = ResolveProjectPlan(ArrangementCompiler.Compile(temporary)) with { Tag = section.Id };
+            var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), section);
             var ports = PlanPorts(plan, true);
             captureMeter = section.Outline.Meter; SnapshotCaptureSource(); notice = null;
-            Await(host.Start(plan, ports, project.Bpm, repeat)); playingSectionId = id;
+            Await(host.Start(plan, ports, project.Bpm, repeat));
         }
     }
     public void StartArrangement(bool loop = false)
@@ -320,7 +563,6 @@ public sealed class WorkbenchSession : IDisposable
             captureMeter = project.Sections.First(s => s.Id == (project.Arrangement.IsEmpty ? project.Sections[0].Id : project.Arrangement[0].SectionId)).Outline.Meter;
             SnapshotCaptureSource();
             Await(host.Start(plan, ports, project.Bpm, loop));
-            playingSectionId = null;
         }
     }
     public void StartCandidate(bool loop = false)
@@ -331,10 +573,10 @@ public sealed class WorkbenchSession : IDisposable
             if (prepared is null || !ReferenceEquals(preparedFrom, project) || prepared.Id != selectedSectionId) throw new InvalidOperationException("No current candidate.");
             if (armed is not null) throw new InvalidOperationException("Disarm before audition.");
             var temporary = project with { Sections = [prepared], Arrangement = [] };
-            var plan = ResolveProjectPlan(ArrangementCompiler.Compile(temporary)) with { Tag = prepared.Id };
+            var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), prepared);
             captureMeter = prepared.Outline.Meter;
             SnapshotCaptureSource();
-            Await(host.Start(plan, PlanPorts(plan, true), project.Bpm, loop)); playingSectionId = prepared.Id;
+            Await(host.Start(plan, PlanPorts(plan, true), project.Bpm, loop));
         }
     }
     public void QueueSection(string id, long quantumTicks)
@@ -345,18 +587,18 @@ public sealed class WorkbenchSession : IDisposable
             if (armed is not null) throw new InvalidOperationException("Cannot change sections while recording.");
             var section = project.Sections.FirstOrDefault(s => s.Id == id) ?? throw new ArgumentException("Unknown section.");
             var temporary = project with { Sections = [section], Arrangement = [] };
-            var plan = ResolveProjectPlan(ArrangementCompiler.Compile(temporary)) with { Tag = section.Id };
-            Await(host.QueuePlan(plan, PlanPorts(plan, false), quantumTicks));
+            var plan = TagSection(ResolveProjectPlan(ArrangementCompiler.Compile(temporary)), section);
+            QueueResolved(plan, quantumTicks); auditionQueued = false;
         }
     }
-    public void CancelQueuedSection() { lock (gate) { Await(host.CancelQueuedPlan()); } }
+    public void CancelQueuedSection() { lock (gate) { Await(host.CancelQueuedPlan()); auditionQueued = false; auditionReturning = false; } }
     public void Stop()
     {
-        lock (gate) { Await(host.Stop()); CommitRecording(); ArchiveTake(); }
+        lock (gate) { Await(host.Stop()); ResetAudition(); CommitRecording(); ArchiveTake(); }
     }
     public void Panic()
     {
-        lock (gate) { Await(host.Panic()); CommitRecording(); ArchiveTake(); }
+        lock (gate) { Await(host.Panic()); ResetAudition(); CommitRecording(); ArchiveTake(); }
     }
 
     // Arms a part (or NewPhrase) for recording and thru from the rig input; null disarms.
@@ -417,7 +659,8 @@ public sealed class WorkbenchSession : IDisposable
                 catch (Exception ex) when (ex is InvalidOperationException or ArgumentException) { notice = ex.Message; }
             }
             if (!s.Running && s.Take > archivedTake) ArchiveTake();
-            return new(s.Running, s.Tick, s.Captured, s.CaptureComplete, s.LateNoteOns, s.SkippedClocks, s.DroppedInputs, notice ?? s.Error, revision);
+            return new(s.Running, s.Tick, s.Captured, s.CaptureComplete, s.LateNoteOns, s.SkippedClocks, s.DroppedInputs, notice ?? s.Error, revision)
+                { PlayingSection = PlayingSectionFor(s) };
         }
     }
 
@@ -489,7 +732,7 @@ public sealed class WorkbenchSession : IDisposable
             RequireStopped(); CommitRecording(); ArchiveTake();
             var song = bank?.Songs.FirstOrDefault(s => s.Id == id) ?? throw new ArgumentException("Unknown bank song.");
             Await(host.Arm(null, 1)); armed = null; project = song.Project; selectedSectionId = project.Sections[0].Id;
-            undo.Clear(); redo.Clear(); prepared = null; preparedFrom = null; revision++;
+            undo.Clear(); redo.Clear(); InvalidateGeneration(); revision++;
         }
     }
     public void UpdateBankSong(string id)
@@ -510,7 +753,7 @@ public sealed class WorkbenchSession : IDisposable
         {
             if (Running) throw new InvalidOperationException("Stop playback before opening a project.");
             CommitRecording(); ArchiveTake(); Await(host.Arm(null, 1));
-            project = value; selectedSectionId = value.Sections[0].Id; armed = null; undo.Clear(); redo.Clear(); prepared = null; preparedFrom = null; revision++;
+            project = value; selectedSectionId = value.Sections[0].Id; armed = null; undo.Clear(); redo.Clear(); InvalidateGeneration(); revision++;
         }
     }
     public void ExportMidi(string path)
@@ -655,9 +898,10 @@ public sealed class WorkbenchSession : IDisposable
             resolved = resolved with { ClockPorts = [], Endpoints = endpoints.ToImmutableArray(), OffsetSeconds = offsets.ToImmutableArray(),
                 Events = ordered.OrderBy(x => x.Event.Tick).ThenBy(x => x.Order).Select(x => x.Event).ToImmutableArray() };
             Await(host.Arm(null, 1)); armed = null;
+            ResetAudition();
             captureMeter = take.Meter; captureProjectId = take.SourceProjectId; captureProjectName = take.SourceProjectName; captureInput = rig.Input; captureDestination = null; captureEndpoint = null;
             captureEndpointDestinations = rig.Routes.GroupBy(r => r.EndpointId, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First().Destination, StringComparer.Ordinal);
-            Await(host.Start(resolved, PlanPorts(resolved, true), take.Bpm, false)); playingSectionId = null;
+            Await(host.Start(resolved, PlanPorts(resolved, true), take.Bpm, false));
         }
     }
     public static PerformanceTake ToTake(TransportCapture capture, string? inputId)
@@ -687,6 +931,7 @@ public sealed class WorkbenchSession : IDisposable
     }
     public void Dispose()
     {
+        lock (gate) { if (disposed) return; disposed = true; InvalidateGeneration(); }
         try { lock (gate) { Await(host.Stop()); CommitRecording(); ArchiveTake(); } }
         finally
         {
