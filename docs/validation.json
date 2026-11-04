@@ -2,13 +2,12 @@
   "date": "2026-11-04",
   "sdk": "10.0.403 (linux-x64)",
   "structural_checks": "passed",
-  "dotnet_restore": "passed",
+  "dotnet_restore": "passed (lock files committed)",
   "dotnet_build": "passed: Release, 0 warnings",
-  "behavioral_specifications": "15/15 passed",
-  "cli_smoke_test": "passed: new, validate, simulate",
+  "behavioral_specifications": "43/43 passed",
+  "cli_smoke_test": "passed: new, validate, upgrade, simulate, export, devices, probe loopback",
+  "desktop_smoke_test": "passed under Xvfb: launch, routing apply/reload, loop play, arm, stop",
   "windows_build": "not run",
-  "desktop_smoke_test": "not run",
   "hardware_test": "not run",
-  "source_files": 11,
-  "projects": 8
+  "projects": 9
 }

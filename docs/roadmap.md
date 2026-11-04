@@ -2,17 +2,23 @@
 
 ## 0 — Validate the foundation
 
+Linux: done (build, specs, lock files, desktop under Xvfb). Windows: open.
+
 Restore/build on .NET 10, run specifications, test docking and file pickers on Windows, check floating-window layout recovery and shutdown. Commit real package lock files. Resolve compile/API differences before further features.
 
 Exit: all specs pass and a generated, edited project survives save/open and produces a complete memory capture. No physical timing claim.
 
 ## 1 — Physical MIDI and clock
 
+Implemented in code (rig, transport host, WinMM, panic, faults, probe); hardware exit criteria open.
+
 Implement device enumeration/output/input adapter with Windows MIDI Services capability detection. Add bounded scheduler command queues, ownership/retrigger policies, panic, endpoint faults, timing metrics and physical loopback harness. Replace the demonstration wait loop with measured scheduling behavior. Add rig persistence and selection.
 
 Exit: sustained notes release, clock is measured under load, disconnect/reconnect and stop/restart behave explicitly. Only then permit hardware performance claims.
 
 ## 2 — Drummer and keyboard capture
+
+Implemented: drummer port, keyboard recording, thru, sustain, overdub, MIDI file export. Open: step entry, count-in, retrospective capture, hardware run.
 
 Extract/test appropriate MusicSessionTrace planner code and integrate it with shared timing. Add input recording, step entry, overdub, count-in, retrospective input/output buffers, sustain handling and SMF export with tempo mapping. Avoid routing generated output back into its own input.
 

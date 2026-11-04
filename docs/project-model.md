@@ -1,12 +1,18 @@
 # Project model
 
-## Implemented schema 1
+## Implemented schema 2
 
-SongProject → Sections → Parts → Pattern → MidiNotes. Outline owns meter, bars, scale, root, density, intensity, variation and seed. Each part owns a logical destination and one-based channel. PatternKind is Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock.
+SongProject → Sections → Parts → Pattern → MidiNotes. Outline owns meter, bars, scale, root, density, intensity, variation and seed. Each part owns a role, a logical destination and a one-based channel. PatternKind is Fixed, Generative or Hybrid. Notes have stable IDs, tick/duration, pitch/velocity and a lock.
 
-Data uses immutable collections. The compiler produces a plan consumed by one transport owner. Project loading validates musical bounds and refuses unsupported schema versions. No compatibility or migration promise is made for pre-release schema 1.
+Patterns carry an optional Recipe: generator (`scaffold` or `drummer`), generator version, random algorithm (`xorshift32`), seed and, for the drummer, persona, complexity, fills, swing and half-time. Regeneration keeps a part's generator unless the user selects another.
 
-The demonstration generator creates four named roles. Its Pad is a sustained single note, not a completed chord/voice-leading generator. Drums are a simple seeded grid, not the MusicSessionTrace synthetic drummer. Pulse is a scale sequence, not a completed input-driven arpeggiator.
+Schema 1 files migrate on load: `generatorVersion`/`generatorSeed` become a scaffold recipe. Other versions and unknown properties are rejected. `cli upgrade` rewrites a file in schema 2.
+
+Roles Drums, Bass, Pulse and Pad are generated. Phrase parts hold recorded or manual material and are never generated. Pad is a sustained single note and Pulse a scale sequence; neither is a finished chord or arpeggiator generator.
+
+## Rig schema 1
+
+Endpoints (ID, send clock, delay 0–100 ms), routes (destination → endpoint, optional channel override) and an optional input endpoint. Validated on load; unsupported versions are rejected. Machine-local, never part of a song.
 
 ## Planned schema expansion
 
@@ -25,12 +31,12 @@ Track identity should ultimately be project-wide rather than duplicated per sect
 
 Recipe metadata: generator ID/version, stable PRNG algorithm/version, seed per part, source motif references, constraints, scope and accepted candidate. A seed alone does not preserve a live performance or guarantee compatibility across algorithm changes.
 
-Manual edits need explicit override records and deletion tombstones. Until these exist, added notes are locked, changed notes can be locked, and deletion freezes the whole pattern. Warn/document this behavior instead of recreating deleted notes on the next Generate.
+Manual edits need explicit override records and deletion tombstones. Until these exist, added and recorded notes are locked, changed notes can be locked, and deletion freezes the whole pattern. Warn/document this behavior instead of recreating deleted notes on the next Generate.
 
 Development curves use musical time and typed parameter IDs. Density, intensity and variation are distinct. Optional device mappings translate a parameter into configured CC/NRPN/SysEx messages. No universal filter/FM mapping is assumed. Untransmitted synth changes and synthesis remain out of scope.
 
 ## Capture
 
-PerformanceTake records timestamped emitted messages in seconds from transport start, initial BPM, tempo-change records and completeness. The current sink is memory only. Input recording and performance-action journals are future streams. Exported captures never claim that the hardware sounded at the recorded submission timestamp.
+PerformanceTake schema 2: start time, initial BPM, completeness, outputs (endpoint, destination), inputs (rig input endpoint), action journal (start, stop, end, panic, tempo, arm, fault) and tempo changes. Seconds are submission or host-arrival times from transport start. Thru output is not captured separately.
 
-Separate source input, processed output and commands to avoid feedback or double-processing during replay. SMF export needs a tempo map; preserve wall time and transport gaps explicitly. Store JSON sidecars for events that do not map naturally into SMF. Device patches are optional references, not mandatory recall requirements.
+Saving a take as `.mid` converts times to ticks through the recorded tempo map, one track per destination plus an input track. Section export writes one track per part at the project tempo. Exported files never claim that hardware sounded at the recorded time. Device patches remain optional references, not recall requirements.

@@ -1,6 +1,6 @@
 # ADR 002: Native clock and prepared MIDI plans
 
-Status: architecture accepted; hardware backend selection pending measurement.
+Status: architecture accepted; WinMM implemented as the first backend; Windows MIDI Services not yet evaluated; measurements pending.
 
 Musical planning can happen ahead of playback. Expensive generation is never part of a timing deadline. Keep monotonic host time, musical position, MIDI synchronization and physical device latency separate.
 
@@ -8,7 +8,7 @@ Musical planning can happen ahead of playback. Expensive generation is never par
 
 Evaluate Windows MIDI Services first for timestamped output and input timestamps. Keep an adapter contract so a documented legacy fallback can be added if the user's installation or interface requires it. Do not assume API availability, driver behavior or cancellation semantics from the operating-system name alone.
 
-The current IMidiSink is deliberately minimal and implemented only by MemoryMidiSink. A production adapter needs enumeration, stable endpoint identity, input subscription, timestamp conversion, scheduled-output capability, bounded lookahead, clock/transport support, disconnect notification and cancellation/flush semantics. Report these as capabilities, not assumptions. UMP and legacy MIDI translation belong here, not in generators.
+`IMidiBackend` and its ports implement enumeration, open, immediate or scheduled submission, cancellation, fault reporting and input callbacks. WinMM (no dependency, immediate send, host-arrival input timestamps, polled endpoint changes) is implemented and compile-checked; it has not run on Windows. Still needed per adapter: enumeration, stable endpoint identity, input subscription, timestamp conversion, scheduled-output capability, bounded lookahead, clock/transport support, disconnect notification and cancellation/flush semantics, reported as capabilities, not assumptions. `cli probe` measures loopback latency for the gate below. UMP and legacy MIDI translation belong here, not in generators.
 
 ## Scheduling policy
 

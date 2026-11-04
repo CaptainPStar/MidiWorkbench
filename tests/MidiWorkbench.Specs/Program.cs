@@ -288,6 +288,24 @@ var tests = new (string Name, Action Run)[]
         host.Stop(); now = .05; host.Step(.05); now = .1; host.Step(.1);
         Check(port.Count(0x90) == 1 && port.Count(0x80) == 1 && port.Sent[^1].Message.Status == 0xFC, "Stop did not release");
     }),
+    ("adapter: shutdown flushes queued releases", () =>
+    {
+        var now = 0d; var backend = new FakeBackend(() => now); var port = backend.Add("memory", false);
+        var host = new TransportHost(new HostOptions(Background: false, LookaheadSeconds: .05));
+        host.Start(Build.Plan(new MidiNote("a",0,3000,60,90)), [port], 120, false); host.Step(0);
+        now = .01; host.Step(.01);
+        host.Dispose();
+        Check(port.Count(0x90) == 1 && port.Count(0x80) == 1, "Release lost on shutdown");
+    }),
+    ("adapter: restart flushes releases queued by the previous stop", () =>
+    {
+        var now = 0d; var backend = new FakeBackend(() => now); var port = backend.Add("memory", false);
+        using var host = new TransportHost(new HostOptions(Background: false, LookaheadSeconds: .05));
+        var plan = Build.Plan(new MidiNote("a",0,3000,60,90));
+        host.Start(plan, [port], 120, false); host.Step(0);
+        now = .01; host.Step(.01); host.Stop(); host.Start(plan, [port], 120, false); host.Step(.01);
+        Check(port.Count(0x80) == 1 && port.Count(0x90) == 2, "Release lost on restart");
+    }),
     ("adapter: backlog beyond capacity faults instead of growing", () =>
     {
         var now = 0d; var backend = new FakeBackend(() => now); var port = backend.Add("memory", false);

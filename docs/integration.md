@@ -2,6 +2,10 @@
 
 Planned 2026-11-04 from source inspection, a Linux build/spec run (see status.md) and MusicSessionTrace at f9d8e5a.
 
+## Progress
+
+Phases 0, 1, 3a and 4 are implemented and specified on Linux. Phases 2 and 3b are implemented with WinMM and compile-checked only. Phase 5 and the Windows half of phase 0 remain; status.md lists the acceptance steps. Decisions: drummer copied; part channel authoritative with optional rig override; thru through the worker; output backend WinMM first, Windows MIDI Services after measurement. The Windows adapter targets `net10.0` with runtime OS checks instead of `net10.0-windows`, so the solution builds everywhere.
+
 ## Target slice
 
 On Windows, one MIDI interface, one keyboard, external synths:

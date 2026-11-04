@@ -131,6 +131,7 @@ public sealed class TransportHost : IDisposable
         {
             case Kind.Start:
                 if (transport.Running) { transport.Stop(now); Act(now, "stop"); }
+                FlushPending();
                 Interlocked.Increment(ref sequence);
                 plan = c.Plan!; ports = c.Ports; loop = c.Loop;
                 pending = ports.Select(_ => new Queue<TimedMidi>()).ToArray();
@@ -164,7 +165,7 @@ public sealed class TransportHost : IDisposable
                 Act(now, "arm", thru?.EndpointId);
                 break;
             case Kind.Exit:
-                transport.Stop(now); ReleaseThru(now); exit.Cancel();
+                transport.Stop(now); ReleaseThru(now); FlushPending(); exit.Cancel();
                 break;
         }
         running = transport.Running;
@@ -194,6 +195,12 @@ public sealed class TransportHost : IDisposable
         if (ports[port].ScheduledSend || m.Seconds <= current && pending[port].Count == 0) { Submit(port, m); return; }
         if (pending[port].Count >= options.PendingCapacity) { Fault(port, "output backlog exceeded"); return; }
         pending[port].Enqueue(m);
+    }
+    // Releases queued for an immediate port must not be dropped when the queues are replaced or the worker exits.
+    private void FlushPending()
+    {
+        for (var i = 0; i < pending.Length; i++)
+            while (!faulted[i] && pending[i].TryDequeue(out var m)) Submit(i, m);
     }
     private void Submit(int port, TimedMidi m)
     {
@@ -243,7 +250,7 @@ public sealed class TransportHost : IDisposable
     }
     public void Dispose()
     {
-        if (worker is null) { Step(clock()); transport.Stop(clock()); ReleaseThru(clock()); }
+        if (worker is null) { Step(clock()); transport.Stop(clock()); ReleaseThru(clock()); FlushPending(); }
         else if (!exit.IsCancellationRequested)
         {
             try { Post(Kind.Exit); } catch (InvalidOperationException) { exit.Cancel(); }

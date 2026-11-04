@@ -8,14 +8,17 @@ Avalonia and Dock provide a rearrangeable desktop workspace. The musical model, 
 
 - Dockable Outline, Patterns, Perform and Routing panes; local layout persistence and reset.
 - Section outline: meter, length, root, scale, density, intensity, variation and seed.
-- Deterministic demonstration generators for drums, bass, pulse and a sustained pad note.
+- Drummer with nine personas (complexity, fills, swing, half-time) in any meter; demonstration bass, pulse and pad generators.
 - Note list editing, adding, deleting and locks; fixed patterns survive regeneration.
-- Meter-aware bar/beat display, tempo changes retaining musical position.
-- In-memory playback, MIDI Clock messages, bounded event capture and explicit overflow status.
-- Validated, versioned JSON projects and JSON event captures; CLI generation/validation/simulation.
-- Fifteen executable specifications covering generation, timing, ownership, persistence and capture.
+- Machine-local rig: destination → output and channel, per-output clock and delay, keyboard input.
+- Transport worker with lookahead scheduling, loop, Stop and Panic; one MIDI Clock stream per output.
+- Keyboard recording with thru into a part or a new part; loop passes overdub; sustain pedal handled.
+- Windows MIDI output and input through WinMM. Implemented, not yet run on Windows or hardware.
+- Versioned JSON projects (schema 2, migrates schema 1), takes with separate inputs, outputs and actions, Standard MIDI File export.
+- CLI: new, validate, upgrade, simulate, export, devices, probe.
+- 43 executable specifications, including adapter conformance and drummer equivalence with the original planner.
 
-This is a foundation, not the finished sequencer. Playback sends only to memory and is silent. Physical MIDI I/O, the MusicSessionTrace drummer, keyboard recording, scene launching, piano roll, SMF export and background generation during playback remain planned.
+Scene launching, piano roll, undo, multi-section playback, external clock following and background generation during playback remain planned.
 
 ## Build and run
 
@@ -26,29 +29,31 @@ Install a stable .NET 10 SDK. `global.json` accepts newer .NET 10 feature bands.
 dotnet run --project src/MidiWorkbench.Desktop
 ```
 
-On Linux/macOS: `bash scripts/verify.sh`. Windows is the initial target for real MIDI integration; the memory engine and shell are platform-neutral.
+On Linux/macOS: `bash scripts/verify.sh`. Device MIDI is Windows-only; other platforms offer the silent Memory output and a Loopback endpoint.
 
 ```powershell
 dotnet run --project src/MidiWorkbench.Cli -- new song.midiwork.json
-dotnet run --project src/MidiWorkbench.Cli -- validate song.midiwork.json
 dotnet run --project src/MidiWorkbench.Cli -- simulate song.midiwork.json take.json
+dotnet run --project src/MidiWorkbench.Cli -- export song.midiwork.json song.mid
+dotnet run --project src/MidiWorkbench.Cli -- devices
+dotnet run --project src/MidiWorkbench.Cli -- probe OUTPUT_ID INPUT_ID 30
 ```
 
-The CLI simulates the first section using synthetic timestamps. It does not measure wall-clock scheduling or send MIDI to devices. Capture files are JSON, not Standard MIDI Files.
+`simulate` uses synthetic time and memory output. `probe` sends notes through a physical loop (output cable into input) and reports arrival latency; arrival is host time at the input callback, not sound onset.
 
 ## First session
 
-1. Adjust the outline and Generate. Vary advances the seed and regenerates.
-2. Select a part and a note; edit its values and Apply note. Enable Lock to preserve it during regeneration. Added notes start locked. Deleting a note freezes that part as a fixed pattern, preserving the deletion.
-3. Play to exercise transport and event capture. Stop before editing or regenerating in this build.
-4. Save the project or Save take. Each Play starts a new bounded capture; save the previous take first if needed.
-5. Drag pane tabs to rearrange/dock/float. Reset layout restores the default arrangement.
+1. Routing: choose an output for each destination and, for recording, an input. Apply saves the rig to `LocalApplicationData/MidiWorkbench/rig.json`.
+2. Outline: adjust and Generate. Drums selects Basic or a drummer persona. Vary advances the seed.
+3. Patterns: select a note, edit, Apply note. Lock preserves it during regeneration. Added and recorded notes start locked. Deleting a note freezes that part as a fixed pattern.
+4. Perform: choose Record into, then Play (optionally Loop). Played notes go through to the part's output and are added on Stop.
+5. Save, Save take (`.json` or `.mid`) or Export MIDI. Panic releases all notes immediately.
 
-Project save/open never starts playback. Dock layout is local machine state and is independent of the song. The current UI edits/plays the first section; multi-section data is retained on load/save.
+Project save/open never starts playback. Routing and dock layout are local machine state, independent of the song. The UI edits and plays the first section; other sections are retained on load/save.
 
 ## Verification status
 
-Restores, builds and passes all specifications on Linux with SDK 10.0.403. Not yet built on Windows, visually exercised or run against hardware; see docs/status.md.
+Builds and passes all specifications on Linux with SDK 10.0.403; the desktop was exercised under a virtual X display. Not yet built or run on Windows or with MIDI hardware; see docs/status.md.
 
 ## Documentation
 
@@ -62,4 +67,4 @@ Restores, builds and passes all specifications on Linux with SDK 10.0.403. Not y
 - [End-to-end integration plan](docs/integration.md)
 - [Status and validation](docs/status.md)
 
-No source files were copied from MusicSessionTrace. Its code and documentation informed the architecture and dependency selection. No repository license has been selected; third-party dependencies retain their own licenses.
+No repository license has been selected; third-party dependencies retain their own licenses.

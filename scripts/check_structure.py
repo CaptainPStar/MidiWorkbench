@@ -23,7 +23,7 @@ for file in root.rglob('*.md'):
     for url in re.findall(r'\]\(([^)]+)\)', file.read_text()):
         if '://' not in url and not url.startswith('#'):
             assert (file.parent/url.split('#')[0]).exists(), (file, url)
-for project in ['Domain', 'Generation', 'Engine', 'Persistence']:
+for project in ['Domain', 'Generation', 'Engine', 'Persistence', 'Midi.Windows']:
     for file in (root/'src'/f'MidiWorkbench.{project}').glob('*.cs'):
         assert 'using Avalonia' not in file.read_text(), file
 print(f'PASS: {len(projects)} projects, XML/JSON, references, local documentation links, UI-independent libraries')
