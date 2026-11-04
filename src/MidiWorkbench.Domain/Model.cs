@@ -8,8 +8,10 @@ public static class MusicalTime
     public const int MidiClockTicks = Ppq / 24;
 }
 
-public enum PartRole { Drums, Bass, Pulse, Pad }
+// Phrase is captured or manual material; generators never create it.
+public enum PartRole { Drums, Bass, Pulse, Pad, Phrase }
 public enum PatternKind { Fixed, Generative, Hybrid }
+public enum DrumPersona { Simple, Rock, Alternative, Doom, Sludge, BlackMetal, DeathMetal, Pop, Jazz }
 public sealed record Meter(int Numerator = 4, int Denominator = 4)
 {
     public long BarTicks => (long)MusicalTime.Ppq * 4 * Numerator / Denominator;
@@ -39,16 +41,30 @@ public sealed record MidiNote(string Id, long Tick, long Duration, int Pitch, in
 {
     public long EndTick => checked(Tick + Duration);
 }
+public sealed record DrummerSettings(DrumPersona Persona = DrumPersona.Simple, double Complexity = .3, double Fills = .3,
+    double Swing = 0, bool HalfTime = false)
+{
+    public void Validate()
+    {
+        if (!Enum.IsDefined(Persona) || !double.IsFinite(Complexity) || Complexity is < 0 or > 1 ||
+            !double.IsFinite(Fills) || Fills is < 0 or > 1 || !double.IsFinite(Swing) || Swing is < 0 or > .45)
+            throw new ArgumentException("Drummer needs a listed persona, complexity and fills 0–1, swing 0–0.45.");
+    }
+}
+// Generator and Random name algorithms; a seed alone is not reproducible across algorithm changes.
+public sealed record Recipe(string Generator, string Version, string Random, uint Seed)
+{
+    public DrummerSettings? Drummer { get; init; }
+}
 public sealed record Pattern(string Id, PatternKind Kind, ImmutableArray<MidiNote> Notes)
 {
-    public string? GeneratorVersion { get; init; }
-    public uint? GeneratorSeed { get; init; }
+    public Recipe? Recipe { get; init; }
 }
 public sealed record Part(string Id, string Name, PartRole Role, string Destination, int Channel, Pattern Pattern);
 public sealed record Section(string Id, Outline Outline, ImmutableArray<Part> Parts);
 public sealed record SongProject(int SchemaVersion, string Name, double Bpm, ImmutableArray<Section> Sections)
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
     public void Validate()
     {
         if (SchemaVersion != CurrentSchemaVersion) throw new InvalidDataException("Unsupported project schema; use a compatible application version.");
@@ -72,6 +88,9 @@ public sealed record SongProject(int SchemaVersion, string Name, double Bpm, Imm
                     throw new ArgumentException("Part needs a unique ID, destination and MIDI channel 1–16.");
                 if (!Enum.IsDefined(part.Role) || !Enum.IsDefined(part.Pattern.Kind) || part.Pattern.Notes.IsDefault || part.Pattern.Notes.Length > 100000)
                     throw new ArgumentException("Invalid pattern.");
+                if (part.Pattern.Recipe is { } recipe && (string.IsNullOrWhiteSpace(recipe.Generator) || string.IsNullOrWhiteSpace(recipe.Version) || string.IsNullOrWhiteSpace(recipe.Random)))
+                    throw new ArgumentException("Recipe needs generator, version and random algorithm.");
+                part.Pattern.Recipe?.Drummer?.Validate();
                 var noteIds = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var n in part.Pattern.Notes)
                 {
@@ -84,12 +103,39 @@ public sealed record SongProject(int SchemaVersion, string Name, double Bpm, Imm
         }
     }
 }
-public sealed record DeviceRoute(string Destination, string EndpointId, int Channel, double OffsetMilliseconds = 0);
-public sealed record Rig(int SchemaVersion, ImmutableArray<DeviceRoute> Routes);
-public sealed record CapturedMidi(double Seconds, string Destination, byte Status, byte Data1, byte Data2);
-public sealed record PerformanceTake(int SchemaVersion, DateTimeOffset StartedAt, double Bpm,
-    bool Complete, ImmutableArray<CapturedMidi> Events)
+
+// Machine-local. Offsets delay an endpoint; compensate a slow device by delaying the others.
+public sealed record RigEndpoint(string Id, bool SendClock = true, double OffsetMilliseconds = 0);
+public sealed record DeviceRoute(string Destination, string EndpointId, int? Channel = null);
+public sealed record Rig(int SchemaVersion, ImmutableArray<RigEndpoint> Endpoints, ImmutableArray<DeviceRoute> Routes)
 {
-    public ImmutableArray<TempoChange> TempoChanges { get; init; } = [];
+    public const int CurrentSchemaVersion = 1;
+    public string? Input { get; init; }
+    public static Rig Memory(IEnumerable<string> destinations) => new(CurrentSchemaVersion, [new("memory")],
+        destinations.Distinct(StringComparer.Ordinal).Select(d => new DeviceRoute(d, "memory")).ToImmutableArray());
+    public void Validate()
+    {
+        if (SchemaVersion != CurrentSchemaVersion) throw new InvalidDataException("Unsupported rig schema; use a compatible application version.");
+        if (Endpoints.IsDefault || Routes.IsDefault || Endpoints.Length > 256 || Routes.Length > 1024) throw new ArgumentException("Invalid rig.");
+        var endpoints = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var e in Endpoints)
+            if (e is null || string.IsNullOrWhiteSpace(e.Id) || !endpoints.Add(e.Id) || !double.IsFinite(e.OffsetMilliseconds) || e.OffsetMilliseconds is < 0 or > 100)
+                throw new ArgumentException("Rig endpoints need unique IDs and offsets of 0–100 ms.");
+        var destinations = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var r in Routes)
+            if (r is null || string.IsNullOrWhiteSpace(r.Destination) || !destinations.Add(r.Destination) || !endpoints.Contains(r.EndpointId) || r.Channel is < 1 or > 16)
+                throw new ArgumentException("Each destination needs one route to a listed endpoint and channel 1–16.");
+        if (Input is not null && string.IsNullOrWhiteSpace(Input)) throw new ArgumentException("Invalid rig input.");
+    }
 }
+
+public sealed record CapturedMidi(double Seconds, string Endpoint, string? Destination, byte Status, byte Data1, byte Data2);
+public sealed record PerformanceAction(double Seconds, string Kind, string? Value = null);
 public sealed record TempoChange(double Seconds, double Bpm);
+// Seconds are submission or host-arrival times from transport start, not physical sound onset.
+public sealed record PerformanceTake(int SchemaVersion, DateTimeOffset StartedAt, double Bpm, bool Complete,
+    ImmutableArray<CapturedMidi> Outputs, ImmutableArray<CapturedMidi> Inputs, ImmutableArray<PerformanceAction> Actions,
+    ImmutableArray<TempoChange> TempoChanges)
+{
+    public const int CurrentSchemaVersion = 2;
+}
