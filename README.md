@@ -23,7 +23,7 @@ Accepted notes are saved with their generator recipes. Opening a project does no
 - WinMM input/output and a dedicated transport worker; Memory and Loopback adapters for portable testing.
 - CLI operations for projects, generators, arranged-song simulation, MIDI export, banks and loopback measurements.
 
-The application builds and runs on Windows. Windows virtualMIDI delivery, shutdown and reopen checks pass on four ports; physical synth timing and unplug/reconnect acceptance remain separate. See [verification status](docs/status.md) for measured results and limits.
+The application builds and runs on Windows. Windows virtualMIDI checks pass on four ports. A Studio 24c physical cable loop passes dense delivery, Stop/Panic/shutdown cleanup and port reopening under UI workload; actual synth behavior and unplug/reconnect acceptance remain separate. See [verification status](docs/status.md) for measured results and limits.
 
 ## Build and run
 
