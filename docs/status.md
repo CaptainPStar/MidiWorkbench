@@ -1,5 +1,12 @@
 # Verification status
 
+## 2026-11-06 Studio 24c physical cable loop
+
+- The user-connected Studio 24c DIN OUT-to-IN loop passes the packaged 30-second probe and 60-second dense playback under repeated offscreen UI workload. All 3,840 note pairs and 2,880 clocks arrived; the complete 10,564-message stream matched submitted bytes and order.
+- Active Stop, Panic and shutdown released sixteen held notes and sustain. Stop/Panic were checked before disposal. Closing and reopening both ports preserved exact send/receive delivery.
+- Four UI rounds passed 1,092 assertions, overlapping 59.658/60 seconds. Loaded clock-spacing error p99/max was 0.860/0.979 ms. Dense sixteen-note chord latency p99/max was 15.818/16.782 ms, including physical serialization. Timing measurements are descriptive.
+- No production change was required. See the [physical cable-loop report](reports/physical-loopback-2026-11-06.md) for test-isolation corrections, evidence and limits. Physical unplug/reconnect, actual synth/acoustic behavior and attended native UI acceptance remain open.
+
 ## 2026-11-05 musical workflow refinement
 
 - At application revision `f884d1c`, locked restore and serial Release verification pass with zero warnings/errors: 61 core specification groups and 273 offscreen desktop checks.
@@ -9,7 +16,7 @@
 - The current five-minute virtualMIDI run delivered 19,200 balanced note pairs and 14,400 clocks per approved port, with no late attacks, skipped clocks, ownership residue or endpoint errors. Sustain cleanup, shutdown and reopen passed. Capture correctly reported its planned 100,000-entry overflow while independent output traces remained intact.
 - Eighteen UI workload rounds passed 4,914 assertions; at least 299.929 of 300 seconds overlapped individual rounds. Clock-spacing error p99 was 0.873–0.887 ms, maximum 12.460 ms. Planned clock deadline-to-dispatch p99 was 0.997–1.133 ms, maximum 12.842 ms. These tails remain a limitation; no hard-real-time or physical synth certification is claimed.
 
-The sections below record earlier revisions and workloads. Native human/file-picker acceptance, acoustic results and physical-interface acceptance remain open.
+The sections below record earlier revisions and workloads. Native human/file-picker acceptance, acoustic results and physical unplug/reconnect remain open; the November 6 section records cable-loop acceptance.
 
 ## 2026-11-04 timing and workflow follow-up
 
@@ -61,9 +68,11 @@ Software loopback probe (4 seconds, concurrent development container): 16/16 not
 
 ## Hardware acceptance still required
 
-1. Build/run on Windows and enumerate the intended MIDI interfaces.
-2. Record physical cable-loopback measurements, idle and under CPU/UI load, including clock timing and inter-port skew.
-3. Play dense chords/drums and sustained keyboard input; change tempo; exercise Stop/Panic, pedal release, repeated notes and queued launches.
+Windows build, enumeration and single-interface cable-loop checks are complete. Remaining physical and attended checks:
+
+1. Validate the native interface and file pickers with a human performer.
+2. Measure multi-interface physical timing and inter-port skew where the intended setup requires them.
+3. Use the actual synths and sustained keyboard input; change tempo and exercise pedal behavior, repeated notes and queued launches. Single-sequencer dense notes and Stop/Panic cleanup already pass the Studio 24c cable loop.
 4. Unplug/reconnect input and output devices; verify named faults, note release on remaining outputs and successful reopen.
 5. Record multiple takes, save/reopen songs and banks, replay takes and import SMF into the intended DAW.
 6. Test long sessions, sleep/resume and interface/driver-specific behavior. Establish timing thresholds from those measurements.
