@@ -1,11 +1,16 @@
 # Verification status
 
+## 2026-11-06 minilogue xd listening and native first use
+
+- The user confirmed the intended phrase played audibly and ended cleanly on a minilogue xd through Studio 24c MIDI OUT, channel 1. Separate engine-driven Stop and Panic checks also released cleanly.
+- The user confirmed native Open -> Routing -> Play, edit -> Save as -> reopen -> playback, looping playback, the Stop button and F8 Panic. Both native stop controls released cleanly with no hanging notes. No application fix was required. See the [first-use report](reports/minilogue-first-use-2026-11-06.md) for evidence and the remaining musical/session checks.
+
 ## 2026-11-06 Studio 24c physical cable loop
 
 - The user-connected Studio 24c DIN OUT-to-IN loop passes the packaged 30-second probe and 60-second dense playback under repeated offscreen UI workload. All 3,840 note pairs and 2,880 clocks arrived; the complete 10,564-message stream matched submitted bytes and order.
 - Active Stop, Panic and shutdown released sixteen held notes and sustain. Stop/Panic were checked before disposal. Closing and reopening both ports preserved exact send/receive delivery.
 - Four UI rounds passed 1,092 assertions, overlapping 59.658/60 seconds. Loaded clock-spacing error p99/max was 0.860/0.979 ms. Dense sixteen-note chord latency p99/max was 15.818/16.782 ms, including physical serialization. Timing measurements are descriptive.
-- No production change was required. See the [physical cable-loop report](reports/physical-loopback-2026-11-06.md) for test-isolation corrections, evidence and limits. Physical unplug/reconnect, actual synth/acoustic behavior and attended native UI acceptance remain open.
+- No production change was required. See the [physical cable-loop report](reports/physical-loopback-2026-11-06.md) for test-isolation corrections, evidence and limits. Physical unplug/reconnect and broader instrument/session acceptance remain open. The first-use section above records the subsequent bounded listening and native desktop checks.
 
 ## 2026-11-05 musical workflow refinement
 
